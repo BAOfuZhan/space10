@@ -59,7 +59,7 @@ ENDTIME = "20:00:40"  # 根据学校的预约座位时间+1min即可
 
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平台）
-MAX_ATTEMPT = 30  # 最大尝试次数（减少到30次，确保3个配置都能尝试）
+MAX_ATTEMPT = 100  # 最大尝试次数（减少到30次，确保3个配置都能尝试）
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 
 
@@ -67,19 +67,6 @@ RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 # True：每一轮都会重新创建会话并登录（原有行为）；
 # False：每个账号只在第一次需要时登录一次，后续循环复用同一个会话。
 RELOGIN_EVERY_LOOP = True
-
-# 策略相关参数的默认值（可在 config.json 中覆盖）
-# STRATEGY_LOGIN_LEAD_SECONDS: 在目标时间前多少秒开始进行登录和基础 session/token 预热
-STRATEGY_LOGIN_LEAD_SECONDS = 18
-# STRATEGY_SLIDER_LEAD_SECONDS: 在目标时间前多少秒开始进行验证
-STRATEGY_SLIDER_LEAD_SECONDS = 14
-# FIRST_SUBMIT_OFFSET_MS: 第一次提交时，在目标时间之后再延迟多少毫秒去获取 token 并立即提交
-FIRST_SUBMIT_OFFSET_MS = 89
-# TARGET_OFFSET2_MS / TARGET_OFFSET3_MS:
-# 在第一次失败后，再额外延迟多少毫秒提交第二 / 第三次带验证码的请求
-# 例如：1200ms、1500ms
-TARGET_OFFSET2_MS = 150
-TARGET_OFFSET3_MS = 160
 
 
 def _get_beijing_target_from_endtime() -> datetime.datetime:
@@ -243,64 +230,82 @@ def strategic_first_attempt(
             captcha1 = get_textclick_with_retry("First")
             captcha2 = get_textclick_with_retry("Second")
 
-        # 3. 第一次提交：在目标时间 + FIRST_SUBMIT_OFFSET_MS 毫秒时获取页面 token，获取后立即提交
-        token_fetch_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
-        while _beijing_now() < token_fetch_dt1:
-            # 更短的 sleep 间隔，提高 FIRST_SUBMIT_OFFSET_MS 附近的精度
-            time.sleep(0.001)
+        # token URL 供所有 3 次提交复用
+        _token_url = s.url.format(
+            roomId=roomid,
+            day=str(_beijing_now().date()),
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
 
-        logging.info(
-            f"[strategic] Fetch page token for first submit at {token_fetch_dt1} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
-        )
-        token1, value1 = s._get_page_token(
-            s.url.format(
-                roomId=roomid,
-                day=str(_beijing_now().date()),
-                seatPageId=seat_page_id or "",
-                fidEnc=fid_enc or "",
-            ),
-            require_value=True,
-        )
-        if not token1:
-            logging.error("[strategic] Failed to get page token for first submit, skip this config")
-            continue
-        logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+        if STRATEGIC_MODE == "A":
+            # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
+            #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交
+            pre_fetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
+            while _beijing_now() < pre_fetch_dt:
+                time.sleep(0.1)
+            logging.info(
+                f"[strategic] [A] Pre-fetch page token at {_beijing_now()} (target_dt - {PRE_FETCH_TOKEN_MS}ms)"
+            )
+            token1, value1 = s._get_page_token(_token_url, require_value=True)
+            if not token1:
+                logging.error("[strategic] Failed to get page token for first submit, skip this config")
+                continue
+            logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
 
-        logging.info(
-            f"[strategic] Immediately do first submit after fetching page token (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
-        )
-        suc = s.get_submit(
-            url=s.submit_url,
-            times=times,
-            token=token1,
-            roomid=roomid,
-            seatid=first_seat,
-            captcha=captcha1,
-            action=action,
-            value=value1,
-        )
+            submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
+            while _beijing_now() < submit_dt1:
+                time.sleep(0.001)
+            logging.info(
+                f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
+            )
+            suc = s.get_submit(
+                url=s.submit_url,
+                times=times,
+                token=token1,
+                roomid=roomid,
+                seatid=first_seat,
+                captcha=captcha1,
+                action=action,
+                value=value1,
+            )
+
+        else:
+            # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
+            token_fetch_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
+            while _beijing_now() < token_fetch_dt1:
+                time.sleep(0.001)
+            logging.info(
+                f"[strategic] [B] Fetch page token at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
+            )
+            token1, value1 = s._get_page_token(_token_url, require_value=True)
+            if not token1:
+                logging.error("[strategic] Failed to get page token for first submit, skip this config")
+                continue
+            logging.info(f"[strategic] Got page token for first submit: {token1}, value: {value1}")
+            logging.info(f"[strategic] [B] Immediately submit after fetching page token")
+            suc = s.get_submit(
+                url=s.submit_url,
+                times=times,
+                token=token1,
+                roomid=roomid,
+                seatid=first_seat,
+                captcha=captcha1,
+                action=action,
+                value=value1,
+            )
 
         # 如果第一次没有成功：为第二次提交重新获取页面 token，再延迟 TARGET_OFFSET2_MS 毫秒提交
         if not suc:
             logging.info("[strategic] First submit failed, prepare second submit with NEW page token")
 
-            # 先重新获取一次页面 token
-            token2, value2 = s._get_page_token(
-                s.url.format(
-                    roomId=roomid,
-                    day=str(_beijing_now().date()),
-                    seatPageId=seat_page_id or "",
-                    fidEnc=fid_enc or "",
-                ),
-                require_value=True,
-            )
+            token2, value2 = s._get_page_token(_token_url, require_value=True)
             if not token2:
                 logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
             else:
                 send_dt2 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET2_MS)
                 while _beijing_now() < send_dt2:
                     time.sleep(0.02)
-
                 logging.info(
                     f"[strategic] Second submit at {send_dt2} (now + {TARGET_OFFSET2_MS}ms) with NEW page token"
                 )
@@ -319,22 +324,13 @@ def strategic_first_attempt(
         if not suc:
             logging.info("[strategic] Second submit failed, prepare third submit with NEW page token")
 
-            token3, value3 = s._get_page_token(
-                s.url.format(
-                    roomId=roomid,
-                    day=str(_beijing_now().date()),
-                    seatPageId=seat_page_id or "",
-                    fidEnc=fid_enc or "",
-                ),
-                require_value=True,
-            )
+            token3, value3 = s._get_page_token(_token_url, require_value=True)
             if not token3:
                 logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
             else:
                 send_dt3 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET3_MS)
                 while _beijing_now() < send_dt3:
                     time.sleep(0.02)
-
                 logging.info(
                     f"[strategic] Third submit at {send_dt3} (now + {TARGET_OFFSET3_MS}ms) with NEW page token"
                 )
@@ -625,14 +621,15 @@ if __name__ == "__main__":
         config = json.load(data)
         usersdata = config["reserve"]
 
-        # 从 config.json 中读取策略相关配置（如果存在），覆盖默认值
+        # 从 config.json 读取所有策略参数（唯一配置来源）
         strategy_cfg = config.get("strategy", {})
-        STRATEGY_LOGIN_LEAD_SECONDS = int(
-            strategy_cfg.get("login_lead_seconds", STRATEGY_LOGIN_LEAD_SECONDS)
-        )
-        STRATEGY_SLIDER_LEAD_SECONDS = int(
-            strategy_cfg.get("slider_lead_seconds", STRATEGY_SLIDER_LEAD_SECONDS)
-        )
+        STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 18))
+        STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
+        STRATEGIC_MODE               = strategy_cfg.get("mode", "B")
+        PRE_FETCH_TOKEN_MS           = int(strategy_cfg.get("pre_fetch_token_ms", 3000))
+        FIRST_SUBMIT_OFFSET_MS       = int(strategy_cfg.get("first_submit_offset_ms", 89))
+        TARGET_OFFSET2_MS            = int(strategy_cfg.get("target_offset2_ms", 150))
+        TARGET_OFFSET3_MS            = int(strategy_cfg.get("target_offset3_ms", 160))
 
         # 控制是否在每一轮主循环中都重新登录
         RELOGIN_EVERY_LOOP = bool(config.get("relogin_every_loop", RELOGIN_EVERY_LOOP))
