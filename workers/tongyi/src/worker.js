@@ -740,6 +740,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .empty{text-align:center;padding:60px;color:#999}
 .empty-icon{font-size:48px;margin-bottom:16px}
 .actions{display:flex;gap:8px}
+.zone-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.zone-card{background:#fafafa;border:1px solid #ececec;border-radius:10px;padding:12px}
+.zone-floor{font-size:13px;font-weight:600;color:#333;margin-bottom:8px}
+.zone-list{display:grid;gap:6px}
+.zone-item{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#555;padding:6px 8px;background:#fff;border-radius:6px}
+.zone-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#667eea;background:#eef1ff;padding:2px 6px;border-radius:999px}
 </style>
 </head>
 <body>
@@ -751,6 +757,16 @@ let currentView = "login";
 let currentSchool = null;
 let schools = [];
 let users = [];
+const READING_ZONE_GROUPS = [
+  { floor: "2 楼", zones: [{ id: "13474", name: "西阅览区" }, { id: "13473", name: "东阅览区" }, { id: "13476", name: "西电子阅览区" }, { id: "13472", name: "东电子阅览区" }] },
+  { floor: "3 楼", zones: [{ id: "13481", name: "西阅览区" }, { id: "13484", name: "中阅览区" }, { id: "13478", name: "东阅览区" }, { id: "13480", name: "西电子阅览区" }, { id: "13475", name: "东电子阅览区" }] },
+  { floor: "4 楼", zones: [{ id: "13487", name: "西阅览区" }, { id: "13490", name: "中阅览区" }, { id: "13489", name: "东阅览区" }, { id: "13485", name: "西电子阅览区" }, { id: "13486", name: "东电子阅览区" }, { id: "13492", name: "南区" }] },
+  { floor: "5 楼", zones: [{ id: "13493", name: "西阅览区" }, { id: "13497", name: "中阅览区" }, { id: "13494", name: "东阅览区" }] },
+  { floor: "6 楼", zones: [{ id: "13499", name: "西阅览区" }, { id: "13500", name: "中阅览区" }, { id: "13502", name: "东阅览区" }, { id: "13505", name: "北阅览区" }] },
+  { floor: "7 楼", zones: [{ id: "13504", name: "西阅览区" }, { id: "13506", name: "中阅览区" }, { id: "13507", name: "东阅览区" }] },
+  { floor: "8 楼", zones: [{ id: "13495", name: "西阅览区" }, { id: "13496", name: "中阅览室" }, { id: "13498", name: "东阅览区" }, { id: "13501", name: "电子西阅览区" }, { id: "13503", name: "电子东阅览区" }] },
+  { floor: "9 楼", zones: [{ id: "13491", name: "西阅览室" }, { id: "13488", name: "中阅览区" }, { id: "13483", name: "东阅览区" }] },
+];
 
 async function api(method, path, body = null) {
   const opts = {
@@ -940,9 +956,35 @@ function renderSchoolDetail() {
           </table>
         \` : '<div class="empty"><div class="empty-icon">👤</div><p>暂无用户，点击上方按钮添加</p></div>'}
       </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">阅览区 ID 速查</span>
+        </div>
+        \${renderReadingZonePanel()}
+      </div>
     </div>
     \${renderEditSchoolModal()}
     \${renderUserModal()}
+  \`;
+}
+
+function renderReadingZonePanel() {
+  return \`
+    <div class="zone-grid">
+      \${READING_ZONE_GROUPS.map(group => \`
+        <div class="zone-card">
+          <div class="zone-floor">\${group.floor}</div>
+          <div class="zone-list">
+            \${group.zones.map(z => \`
+              <div class="zone-item">
+                <span>\${z.name}</span>
+                <span class="zone-id">\${z.id}</span>
+              </div>
+            \`).join("")}
+          </div>
+        </div>
+      \`).join("")}
+    </div>
   \`;
 }
 
