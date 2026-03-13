@@ -1,6 +1,6 @@
 run-name: >-
   Reserve -
-  ${{ github.event.client_payload.school_id || github.event.client_payload.username || 'manual' }}
+  ${{ github.event.client_payload.school_id || github.event.client_payload.remark || github.event.client_payload.username || 'manual' }}
 
 on:
   repository_dispatch:
@@ -21,6 +21,7 @@ jobs:
           echo "users_matrix=$users" >> "$GITHUB_OUTPUT"
 
   reserve-dispatch:
+    name: reserve-dispatch (${{ matrix.user.remark || matrix.user.username || '用户' }})
     if: ${{ github.event_name == 'repository_dispatch' }}
     needs: prepare-dispatch
     runs-on: ubuntu-latest
