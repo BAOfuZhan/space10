@@ -330,13 +330,15 @@ function defaultSchool(id, name) {
     strategy: {
       mode: "C",
       submit_mode: "serial",
-      login_lead_seconds: 14,
+      login_lead_seconds: 18,
       slider_lead_seconds: 10,
+      warm_connection_lead_ms: 2400,
       pre_fetch_token_ms: 1531,
       first_submit_offset_ms: 9,
       target_offset2_ms: 24,
       target_offset3_ms: 140,
       token_fetch_delay_ms: 45,
+      first_token_date_mode: "submit_date",
       token_fetch_delay_range_ms: [45, 45],
       burst_offsets_ms: [120, 420, 820],
       burst_jitter_range_ms: [0, 0],
@@ -1840,13 +1842,30 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
+              <label>首次取 token 日期（first_token_date_mode）</label>
+              <select id="edit_strategy_first_token_date_mode">
+                <option value="submit_date" \${(!st.first_token_date_mode || st.first_token_date_mode==="submit_date")?"selected":""}>submit_date - 与提交日期一致</option>
+                <option value="today" \${st.first_token_date_mode==="today"?"selected":""}>today - 使用当天日期</option>
+              </select>
+            </div>
+            <div class="form-group"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>连接预热提前毫秒（warm_connection_lead_ms）</label>
+              <input type="number" id="edit_strategy_warm_lead" value="\${st.warm_connection_lead_ms || 2400}">
+            </div>
+            <div class="form-group">
               <label>预取 token 提前毫秒（pre_fetch_token_ms）</label>
               <input type="number" id="edit_strategy_prefetch" value="\${st.pre_fetch_token_ms || 1531}">
             </div>
+          </div>
+          <div class="form-row">
             <div class="form-group">
               <label>第二枪目标偏移毫秒（target_offset2_ms）</label>
               <input type="number" id="edit_strategy_target2" value="\${st.target_offset2_ms || 24}">
             </div>
+            <div class="form-group"></div>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2080,11 +2099,13 @@ async function doEditSchool() {
       submit_mode: document.getElementById("edit_strategy_submit").value,
       login_lead_seconds: parseInt(document.getElementById("edit_strategy_login").value) || 14,
       slider_lead_seconds: parseInt(document.getElementById("edit_strategy_slider").value) || 10,
+      warm_connection_lead_ms: parseInt(document.getElementById("edit_strategy_warm_lead").value) || 2400,
       pre_fetch_token_ms: parseInt(document.getElementById("edit_strategy_prefetch").value) || 1531,
       first_submit_offset_ms: parseInt(document.getElementById("edit_strategy_first").value) || 9,
       target_offset2_ms: parseInt(document.getElementById("edit_strategy_target2").value) || 24,
       target_offset3_ms: parseInt(document.getElementById("edit_strategy_target3").value) || 140,
       token_fetch_delay_ms: parseInt(document.getElementById("edit_strategy_delay").value) || 45,
+      first_token_date_mode: document.getElementById("edit_strategy_first_token_date_mode").value,
       token_fetch_delay_range_ms: delayRange,
       burst_offsets_ms: burstOffsets.length ? burstOffsets : [120, 420, 820],
       burst_jitter_range_ms: burstJitterRange,
