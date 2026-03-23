@@ -8,6 +8,7 @@ import datetime
 import os
 from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
+from requests.adapters import HTTPAdapter
 
 # Load environment variables from .env file
 try:
@@ -65,6 +66,69 @@ class CredentialRejectedError(RuntimeError):
     """超星明确拒绝登录凭证时抛出，要求外层立即终止程序。"""
 
 
+class OfficeTraceHTTPAdapter(HTTPAdapter):
+    """在 send() 层记录 office.chaoxing.com 请求的连接池信息。"""
+
+    def __init__(self, owner, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.owner = owner
+
+    @staticmethod
+    def _snapshot_pool(pool, url: str) -> dict:
+        parsed = urlparse(str(url or ""))
+        return {
+            "pool_key": f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else "",
+            "pool_id": hex(id(pool)) if pool is not None else "",
+            "num_connections": getattr(pool, "num_connections", None),
+            "num_requests": getattr(pool, "num_requests", None),
+        }
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        trace_context = getattr(self.owner, "_connection_trace_context", None)
+        should_trace = bool(
+            trace_context and "office.chaoxing.com" in str(getattr(request, "url", ""))
+        )
+
+        before_pool = None
+        before_state = self._snapshot_pool(None, getattr(request, "url", ""))
+        if should_trace:
+            try:
+                before_pool = self.get_connection_with_tls_context(
+                    request, verify, proxies=proxies, cert=cert
+                )
+                before_state = self._snapshot_pool(before_pool, request.url)
+            except Exception as e:
+                before_state["error"] = str(e)
+
+        response = super().send(
+            request,
+            stream=stream,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            proxies=proxies,
+        )
+
+        if should_trace:
+            response_pool = (
+                getattr(response.raw, "_pool", None)
+                or getattr(response.raw, "_connection", None)
+                or before_pool
+            )
+            after_state = self._snapshot_pool(response_pool, request.url)
+            trace = {
+                "kind": trace_context.get("kind", ""),
+                "method": getattr(request, "method", ""),
+                "url": getattr(request, "url", ""),
+                "status_code": getattr(response, "status_code", None),
+                "before": before_state,
+                "after": after_state,
+            }
+            self.owner._record_office_request_trace(trace)
+
+        return response
+
+
 class reserve:
     def __init__(
         self,
@@ -95,9 +159,15 @@ class reserve:
         self.submit_msg = []
         self.last_submit_result = None
         self.requests = requests.session()
+        self._office_trace_adapter = OfficeTraceHTTPAdapter(self)
+        self.requests.mount("https://office.chaoxing.com/", self._office_trace_adapter)
         self.request_timeout = (
             float(os.getenv("CX_CONNECT_TIMEOUT", "3.05")),
             float(os.getenv("CX_READ_TIMEOUT", "5")),
+        )
+        self.fast_probe_timeout = (
+            float(os.getenv("CX_FAST_PROBE_CONNECT_TIMEOUT", "0.36")),
+            float(os.getenv("CX_FAST_PROBE_READ_TIMEOUT", "0.36")),
         )
         self.request_attempts = max(1, int(os.getenv("CX_REQUEST_ATTEMPTS", "3")))
         self.request_retry_delay = float(os.getenv("CX_REQUEST_RETRY_DELAY", "0.2"))
@@ -136,6 +206,8 @@ class reserve:
         self.enable_textclick = enable_textclick
         self.reserve_next_day = reserve_next_day
         self._captcha_context = {}
+        self._connection_trace_context = None
+        self._warm_request_trace = {}
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
     def set_captcha_context(
@@ -187,8 +259,8 @@ class reserve:
         return "已有预约" in msg or "已被占用" in msg
 
     @staticmethod
-    def _get_token_page_msg(response_url: str = "") -> str:
-        parsed = urlparse(str(response_url or ""))
+    def _get_token_page_msg(url_like: str = "") -> str:
+        parsed = urlparse(str(url_like or ""))
         msg_values = parse_qs(parsed.query).get("msg", [])
         for value in msg_values:
             decoded = unquote(str(value or ""))
@@ -197,12 +269,116 @@ class reserve:
         return ""
 
     @classmethod
-    def _is_token_page_not_open(cls, response_url: str = "") -> bool:
+    def _is_token_page_not_open(
+        cls,
+        response_url: str = "",
+        *,
+        status_code: int | None = None,
+        location: str = "",
+    ) -> bool:
         raw_url = str(response_url or "")
-        msg = cls._get_token_page_msg(raw_url)
+        raw_location = str(location or "")
+        msg = cls._get_token_page_msg(raw_location) or cls._get_token_page_msg(raw_url)
+
+        if status_code in {301, 302, 303, 307, 308} and "当前区域未到开放预约时间" in msg:
+            return True
+
         return (
             "当前区域未到开放预约时间" in msg
+            or "msg=%E5%BD%93%E5%89%8D%E5%8C%BA%E5%9F%9F%E6%9C%AA%E5%88%B0%E5%BC%80%E6%94%BE%E9%A2%84%E7%BA%A6%E6%97%B6%E9%97%B4" in raw_location
             or "msg=%E5%BD%93%E5%89%8D%E5%8C%BA%E5%9F%9F%E6%9C%AA%E5%88%B0%E5%BC%80%E6%94%BE%E9%A2%84%E7%BA%A6%E6%97%B6%E9%97%B4" in raw_url
+        )
+
+    @staticmethod
+    def _extract_submit_enc(html: str) -> str:
+        """从页面 HTML 中提取 submit_enc。"""
+        token_matches = re.findall(
+            r'(?:id|name)\s*=\s*["\']submit_enc["\'][^>]*?value\s*=\s*["\'](.*?)["\']',
+            html or "",
+        )
+        return token_matches[0] if token_matches else ""
+
+    def _record_office_request_trace(self, trace: dict):
+        """记录发送层连接追踪信息。"""
+        kind = str(trace.get("kind", "")).strip()
+        before = trace.get("before", {}) or {}
+        after = trace.get("after", {}) or {}
+
+        if kind == "warm":
+            self._warm_request_trace = trace
+            logging.info(
+                "[warm] 连接追踪：连接池=%s，池对象=%s，发送前连接数=%s，请求数=%s，发送后连接数=%s，请求数=%s，状态码=%s",
+                after.get("pool_key") or before.get("pool_key") or "未知",
+                after.get("pool_id") or before.get("pool_id") or "未知",
+                before.get("num_connections"),
+                before.get("num_requests"),
+                after.get("num_connections"),
+                after.get("num_requests"),
+                trace.get("status_code"),
+            )
+            return
+
+        if kind == "first_fast_probe":
+            logging.info(
+                "第一枪轻探测连接复用：%s",
+                self._describe_first_probe_reuse_from_trace(trace),
+            )
+
+    def _describe_first_probe_reuse_from_trace(self, probe_trace: dict) -> str:
+        """基于发送层 trace 判断第一枪是否复用了预热连接。"""
+        warm_trace = self._warm_request_trace or {}
+        warm_after = warm_trace.get("after", {}) or {}
+        probe_before = probe_trace.get("before", {}) or {}
+        probe_after = probe_trace.get("after", {}) or {}
+
+        pool_key = (
+            probe_after.get("pool_key")
+            or probe_before.get("pool_key")
+            or warm_after.get("pool_key")
+            or "未知"
+        )
+        warm_pool_id = warm_after.get("pool_id") or ""
+        probe_pool_id = probe_after.get("pool_id") or probe_before.get("pool_id") or ""
+        warm_conn = warm_after.get("num_connections")
+        warm_req = warm_after.get("num_requests")
+        probe_before_conn = probe_before.get("num_connections")
+        probe_before_req = probe_before.get("num_requests")
+        probe_after_conn = probe_after.get("num_connections")
+        probe_after_req = probe_after.get("num_requests")
+
+        if warm_pool_id and probe_pool_id and warm_pool_id != probe_pool_id:
+            return (
+                f"连接池={pool_key}，是否复用=否，原因=预热池对象 {warm_pool_id}"
+                f" 与第一枪池对象 {probe_pool_id} 不同；预热后连接数/请求数={warm_conn}/{warm_req}"
+                f"，第一枪发送前={probe_before_conn}/{probe_before_req}，发送后={probe_after_conn}/{probe_after_req}"
+            )
+
+        if all(isinstance(v, int) for v in [warm_conn, warm_req, probe_after_conn, probe_after_req]):
+            if (
+                probe_after_conn == warm_conn
+                and probe_after_req == warm_req + 1
+                and warm_conn >= 1
+            ):
+                return (
+                    f"连接池={pool_key}，是否复用=是，原因=预热后连接数保持 {warm_conn}，"
+                    f"请求数 {warm_req}->{probe_after_req}；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+            if isinstance(probe_before_conn, int) and probe_after_conn > probe_before_conn:
+                return (
+                    f"连接池={pool_key}，是否复用=否，原因=第一枪发送时连接数 {probe_before_conn}->{probe_after_conn}"
+                    f" 增加；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+            if probe_after_conn == warm_conn and probe_after_req > warm_req:
+                return (
+                    f"连接池={pool_key}，是否复用=是，原因=预热后连接数保持 {warm_conn}，"
+                    f"请求数 {warm_req}->{probe_after_req}；池对象={probe_pool_id or warm_pool_id or '未知'}"
+                )
+
+        return (
+            f"连接池={pool_key}，是否复用=未知，原因=发送层计数仍不足以确认；"
+            f"预热后池对象/连接数/请求数={warm_pool_id or '未知'}/{warm_conn}/{warm_req}，"
+            f"第一枪发送前={probe_before_conn}/{probe_before_req}，发送后={probe_after_conn}/{probe_after_req}，"
+            f"第一枪池对象={probe_pool_id or '未知'}"
         )
 
     def should_skip_followup_submit(self) -> bool:
@@ -253,46 +429,58 @@ class reserve:
     def _post(self, url, **kwargs):
         return self._request_with_retry("POST", url, **kwargs)
 
-    def probe_not_open_fast(self, url):
+    def probe_not_open_fast(self, url, *, log_connection_reuse: bool = False):
         """轻量探测选座页是否仍处于“未开放”状态。
 
-        只发起一次不跟随重定向的 GET，请求体不做 HTML 解析；
-        优先根据响应头 Location，其次根据最终 response.url 判断是否包含
-        “当前区域未到开放预约时间”提示，以减少开放前的无效负载。
+        只发起一次 GET。
+        若最终页面明确是“未开放”，则立即返回并继续下轮探测；
+        若判断为已开放，则直接尝试复用本次响应 HTML 中的 submit_enc。
 
         返回:
-            True: 明确仍未开放
-            False: 明确不是“未开放”页，可继续正式取 token
-            None: 请求异常或结果不明确，交给正式取 token 流程兜底
+            {
+                "is_not_open": bool,
+                "token": str,
+                "value": str,
+            }
         """
+        if log_connection_reuse:
+            self._connection_trace_context = {"kind": "first_fast_probe"}
         try:
             response = self._get(
                 url=url,
                 verify=False,
                 allow_redirects=False,
+                timeout=self.fast_probe_timeout,
                 attempts=1,
                 request_name="seat page fast not-open probe",
             )
         except requests.exceptions.RequestException as e:
-            logging.warning(f"Fast not-open probe failed for {url}: {e}")
-            return None
+            logging.warning(
+                f"Fast not-open probe failed for {url}: {e}; "
+                "treat as open and switch to formal token fetch"
+            )
+            return {"is_not_open": False, "token": "", "value": ""}
+        finally:
+            if log_connection_reuse:
+                self._connection_trace_context = None
 
+        response_url = getattr(response, "url", "")
+        status_code = getattr(response, "status_code", None)
         location = response.headers.get("Location", "")
-        if location and self._is_token_page_not_open(response_url=location):
-            return True
+        if self._is_token_page_not_open(
+            response_url=response_url,
+            status_code=status_code,
+            location=location,
+        ):
+            response.close()
+            return {"is_not_open": True, "token": "", "value": ""}
 
-        final_url = getattr(response, "url", "") or ""
-        if self._is_token_page_not_open(response_url=final_url):
-            return True
-
-        # 302 但没有命中 not-open 提示，通常说明页面已经进入正常流程或其他跳转页。
-        if response.is_redirect or response.is_permanent_redirect:
-            return False
-
-        if response.status_code == 200:
-            return False
-
-        return None
+        html = response.content.decode("utf-8", errors="ignore")
+        response.close()
+        token = self._extract_submit_enc(html)
+        if token:
+            return {"is_not_open": False, "token": token, "value": token}
+        return {"is_not_open": False, "token": "", "value": ""}
 
     # login and page token
     def _get_page_token(
@@ -358,12 +546,8 @@ class reserve:
             # token 在隐藏 input 中，属性顺序和引号类型可能变化，这里做更宽松的匹配
             # 例如：<input type="hidden" id="submit_enc" value="..."/>
             # 注意：这里需要匹配 id/name 后面的等号和可选空格
-            token_matches = re.findall(
-                r'(?:id|name)\s*=\s*["\']submit_enc["\'][^>]*?value\s*=\s*["\'](.*?)["\']',
-                html,
-            )
-            if token_matches:
-                token = token_matches[0]
+            token = self._extract_submit_enc(html)
+            if token:
                 # 现在页面没有单独的 algorithm 字段，直接复用 submit_enc
                 algorithm_value = token if require_value else ""
                 if attempt > 1:
@@ -437,6 +621,7 @@ class reserve:
         requests.Session 底层使用 urllib3 连接池，相同 host 的后续请求可复用已建立的连接，
         跳过 TCP 三次握手 + TLS 协商，节省约 100-200ms。
         """
+        self._connection_trace_context = {"kind": "warm"}
         try:
             logging.info(f"[warm] Start connection pre-warm request via {url}")
             self._get(
@@ -448,6 +633,8 @@ class reserve:
             )
         except Exception:
             pass
+        finally:
+            self._connection_trace_context = None
 
     def get_login_status(self, attempts=None):
         self.requests.headers = self.login_headers

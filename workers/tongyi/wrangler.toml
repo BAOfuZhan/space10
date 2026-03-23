@@ -6,6 +6,8 @@
 #    然后把返回的 id 填入下方 [[kv_namespaces]]
 # 2. 设置 Secrets:
 #    wrangler secret put GH_TOKEN      # GitHub PAT (repo scope)
+#    wrangler secret put GH_TOKEN_A    # GitHub PAT A (repo scope)
+#    wrangler secret put GH_TOKEN_B    # GitHub PAT B (repo scope)
 #    wrangler secret put API_KEY        # 管理面板登录密钥
 
 name = "tongyi"

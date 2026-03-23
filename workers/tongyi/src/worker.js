@@ -7,7 +7,7 @@
 //
 // KV Schema (binding: SEAT_KV):
 //   schools                     → 学校 ID 列表 ["001", "002", "003"]
-//   school:{id}                 → 学校配置 { id, name, trigger_time, endtime, repo, strategy }
+//   school:{id}                 → 学校配置 { id, name, trigger_time, endtime, repo, github_token_key, strategy }
 //   school:{id}:users           → 用户 ID 列表
 //   school:{id}:user:{userId}   → 单用户完整配置
 //
@@ -90,6 +90,39 @@ function jsonResp(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
+}
+
+function normalizeSecretText(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+const GITHUB_TOKEN_BINDINGS = {
+  a: "GH_TOKEN_A",
+  b: "GH_TOKEN_B",
+};
+
+function resolveGitHubToken(env, school = null) {
+  const tokenKey = normalizeSecretText(school?.github_token_key).toLowerCase();
+  const bindingName = GITHUB_TOKEN_BINDINGS[tokenKey];
+  if (bindingName) {
+    const boundToken = normalizeSecretText(env?.[bindingName]);
+    if (boundToken) return boundToken;
+  }
+  const schoolToken = normalizeSecretText(school?.github_token);
+  if (schoolToken) return schoolToken;
+  return normalizeSecretText(env?.GH_TOKEN);
+}
+
+function sanitizeSchoolForClient(school) {
+  if (!school || typeof school !== "object") return school;
+  const hasGitHubToken = !!normalizeSecretText(school.github_token);
+  const tokenKey = normalizeSecretText(school.github_token_key).toLowerCase();
+  const { github_token, ...rest } = school;
+  return {
+    ...rest,
+    github_token_key: tokenKey,
+    has_github_token: hasGitHubToken || !!tokenKey,
+  };
 }
 
 const HEARTBEAT_LAST_TS_KEY = "meta:heartbeat:last_ts";
@@ -327,6 +360,8 @@ function defaultSchool(id, name) {
     fidEnc: "",
     reading_zone_groups: [],
     repo: `BAOfuZhan/${id}`,
+    github_token_key: "",
+    github_token: "",
     strategy: {
       mode: "C",
       submit_mode: "serial",
@@ -612,6 +647,12 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
 async function dispatchUsersInBatches(env, school, users) {
   const batches = chunkArray(users, BATCH_SIZE);
   let okBatches = 0;
+  const dispatchToken = resolveGitHubToken(env, school);
+
+  if (!dispatchToken) {
+    console.log(`Dispatch skipped for school ${school.id}: missing GitHub token`);
+    return { okBatches: 0, totalBatches: batches.length, error: "Missing GitHub token" };
+  }
 
   for (let i = 0; i < batches.length; i++) {
     const payload = {
@@ -627,7 +668,7 @@ async function dispatchUsersInBatches(env, school, users) {
       })),
     };
 
-    const ok = await dispatchGitHub(env.GH_TOKEN, school.repo, payload);
+    const ok = await dispatchGitHub(dispatchToken, school.repo, payload);
     if (ok) okBatches++;
     console.log(
       `Dispatch batch ${school.id} ${i + 1}/${batches.length}: ${ok ? "OK" : "FAIL"}`
@@ -816,6 +857,9 @@ async function handleScheduled(env) {
     const users = await buildTodayDispatchUsers(env.SEAT_KV, school.id, school, today);
     if (users.length === 0) continue;
     const result = await dispatchUsersInBatches(env, school, users);
+    if (result.error) {
+      console.log(`Scheduled dispatch school ${school.id} failed: ${result.error}`);
+    }
     console.log(
       `Scheduled dispatch school ${school.id}: users=${users.length}, batches=${result.okBatches}/${result.totalBatches}`
     );
@@ -856,7 +900,7 @@ async function handleAPI(request, env, path) {
   // GET /api/schools
   if (method === "GET" && path === "/api/schools") {
     const schools = await getSchoolsSnapshot(KV);
-    return jsonResp({ schools });
+    return jsonResp({ schools: schools.map(sanitizeSchoolForClient) });
   }
 
   // POST /api/school
@@ -866,6 +910,10 @@ async function handleAPI(request, env, path) {
     const name = body.name || `学校 ${id}`;
     const school = defaultSchool(id, name);
     if (body.repo) school.repo = body.repo;
+    if (body.github_token_key !== undefined) {
+      school.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
+    }
+    if (body.github_token !== undefined) school.github_token = normalizeSecretText(body.github_token);
     if (body.trigger_time) school.trigger_time = body.trigger_time;
     if (body.endtime) school.endtime = body.endtime;
     if (body.fidEnc !== undefined) school.fidEnc = body.fidEnc;
@@ -878,14 +926,15 @@ async function handleAPI(request, env, path) {
     }
     // 自动在 GitHub 创建仓库并从 hcd 复制代码
     let repoInit = null;
-    if (school.repo && env.GH_TOKEN) {
+    const repoToken = resolveGitHubToken(env, school);
+    if (school.repo && repoToken) {
       try {
-        repoInit = await createAndInitRepo(school.repo, env.GH_TOKEN);
+        repoInit = await createAndInitRepo(school.repo, repoToken);
       } catch (e) {
         repoInit = { ok: false, error: e.message };
       }
     }
-    return jsonResp({ ok: true, school, repoInit });
+    return jsonResp({ ok: true, school: sanitizeSchoolForClient(school), repoInit });
   }
 
   // GET /api/school/:id
@@ -894,7 +943,7 @@ async function handleAPI(request, env, path) {
     const school = await getSchool(KV, schoolMatch[1]);
     if (!school) return jsonResp({ error: "School not found" }, 404);
     const schoolUsers = await getSchoolUsersSnapshot(KV, schoolMatch[1]);
-    return jsonResp({ school, userCount: schoolUsers.length });
+    return jsonResp({ school: sanitizeSchoolForClient(school), userCount: schoolUsers.length });
   }
 
   // PUT /api/school/:id
@@ -902,9 +951,15 @@ async function handleAPI(request, env, path) {
     const school = await getSchool(KV, schoolMatch[1]);
     if (!school) return jsonResp({ error: "School not found" }, 404);
     const body = await request.json();
+    if (body.github_token !== undefined) {
+      body.github_token = normalizeSecretText(body.github_token);
+    }
+    if (body.github_token_key !== undefined) {
+      body.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
+    }
     Object.assign(school, body, { id: school.id });
     await saveSchool(KV, school);
-    return jsonResp({ ok: true, school });
+    return jsonResp({ ok: true, school: sanitizeSchoolForClient(school) });
   }
 
   // DELETE /api/school/:id
@@ -1060,6 +1115,15 @@ async function handleAPI(request, env, path) {
       return jsonResp({ ok: true, triggeredUsers: 0, okBatches: 0, totalBatches: 0 });
     }
     const result = await dispatchUsersInBatches(env, school, users);
+    if (result.error) {
+      return jsonResp({
+        ok: false,
+        error: result.error,
+        triggeredUsers: users.length,
+        okBatches: result.okBatches,
+        totalBatches: result.totalBatches,
+      }, 400);
+    }
     if (isScheduledFallback) {
       await saveFallbackTriggerRecord(KV, todayDate, schoolId, {
         source: "worker2",
@@ -1113,7 +1177,15 @@ async function handleAPI(request, env, path) {
       endtime: school.endtime,
       strategy: randomizeStrategy(school.strategy),
     };
-    const result = await dispatchGitHubVerbose(env.GH_TOKEN, school.repo, payload);
+    const dispatchToken = resolveGitHubToken(env, school);
+    if (!dispatchToken) {
+      return jsonResp({
+        ok: false,
+        error: "Missing GitHub token",
+        repo: school.repo,
+      }, 400);
+    }
+    const result = await dispatchGitHubVerbose(dispatchToken, school.repo, payload);
     if (!result.ok) {
       return jsonResp({
         ok: false,
@@ -1586,6 +1658,7 @@ function renderSchools() {
               <div class="meta">ID: \${s.id} | 仓库: \${s.repo}</div>
               <div class="stats">
                 <span>\${s.userCount || 0} 名用户</span>
+                <span>独立Token: \${s.has_github_token ? '已配置' : '未配置'}</span>
                 <span>触发时间: \${s.trigger_time}</span>
               </div>
             </div>
@@ -1619,6 +1692,14 @@ function renderAddSchoolModal() {
           <div class="form-group">
             <label>GitHub 仓库</label>
             <input type="text" id="new_school_repo" placeholder="BAOfuZhan/hcd">
+          </div>
+          <div class="form-group">
+            <label>GitHub 密匙槽位</label>
+            <select id="new_school_github_token_key">
+              <option value="">默认 GH_TOKEN</option>
+              <option value="a">A -> GH_TOKEN_A</option>
+              <option value="b">B -> GH_TOKEN_B</option>
+            </select>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -1668,6 +1749,7 @@ function renderSchoolDetail() {
           <div><strong>触发时间:</strong> \${s.trigger_time}</div>
           <div><strong>截止时间:</strong> \${s.endtime}</div>
           <div><strong>GitHub仓库:</strong> \${s.repo}</div>
+          <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
         </div>
       </div>
@@ -1783,6 +1865,14 @@ function renderEditSchoolModal() {
               <label>GitHub 仓库</label>
               <input type="text" id="edit_school_repo" value="\${s.repo || ''}">
             </div>
+          </div>
+          <div class="form-group">
+            <label>GitHub 密匙槽位</label>
+            <select id="edit_school_github_token_key">
+              <option value="" \${!s.github_token_key ? "selected" : ""}>默认 GH_TOKEN</option>
+              <option value="a" \${s.github_token_key==="a" ? "selected" : ""}>A -> GH_TOKEN_A</option>
+              <option value="b" \${s.github_token_key==="b" ? "selected" : ""}>B -> GH_TOKEN_B</option>
+            </select>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2004,6 +2094,7 @@ async function doAddSchool() {
   const id = document.getElementById("new_school_id").value.trim();
   const name = document.getElementById("new_school_name").value.trim();
   const repo = document.getElementById("new_school_repo").value.trim();
+  const github_token_key = document.getElementById("new_school_github_token_key").value.trim().toLowerCase();
   const trigger_time = document.getElementById("new_school_trigger").value.trim();
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
@@ -2012,6 +2103,7 @@ async function doAddSchool() {
     id,
     name,
     repo,
+    github_token_key,
     trigger_time,
     endtime,
     fidEnc,
@@ -2058,6 +2150,7 @@ function showEditSchool() {
 
 async function doEditSchool() {
   const s = currentSchool;
+  const githubTokenKey = document.getElementById("edit_school_github_token_key").value.trim().toLowerCase();
   const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
   const burstOffsets = burstOffsetsText
     .split(",")
@@ -2089,6 +2182,7 @@ async function doEditSchool() {
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
+    github_token_key: githubTokenKey,
     trigger_time: document.getElementById("edit_school_trigger").value.trim(),
     endtime: document.getElementById("edit_school_endtime").value.trim(),
     fidEnc: document.getElementById("edit_school_fidEnc").value.trim(),
