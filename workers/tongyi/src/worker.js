@@ -99,6 +99,7 @@ function normalizeSecretText(value) {
 const GITHUB_TOKEN_BINDINGS = {
   a: "GH_TOKEN_A",
   b: "GH_TOKEN_B",
+  c: "GH_TOKEN_C",
 };
 
 function resolveGitHubToken(env, school = null) {
@@ -401,6 +402,20 @@ function defaultUser(id) {
   };
 }
 
+function getEnabledScheduleSlots(daySchedule) {
+  if (!daySchedule || !daySchedule.enabled) return [];
+  const rawSlots = Array.isArray(daySchedule.slots)
+    ? daySchedule.slots
+    : [{
+        roomid: daySchedule.roomid,
+        seatid: daySchedule.seatid,
+        times: daySchedule.times,
+        seatPageId: daySchedule.seatPageId || "",
+        fidEnc: daySchedule.fidEnc || "",
+      }];
+  return rawSlots.filter(slot => slot && slot.times && slot.roomid);
+}
+
 // ─── GitHub Dispatch ───
 
 async function dispatchGitHub(token, repo, payload) {
@@ -563,7 +578,7 @@ async function createAndInitRepo(repoFullName, ghToken) {
   return { ok: true, repo: `${owner}/${repoName}`, files: newTreeEntries.length };
 }
 
-const BATCH_SIZE = 20;
+const BATCH_SIZE = 10;
 
 function randIntInclusive(min, max) {
   const lo = Math.min(min, max);
@@ -603,6 +618,14 @@ function randomizeStrategy(base) {
   return s;
 }
 
+function buildDispatchPayloadForUser(school, user) {
+  return {
+    ...user,
+    endtime: school.endtime,
+    strategy: randomizeStrategy(school.strategy),
+  };
+}
+
 function chunkArray(arr, size) {
   const chunks = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -618,13 +641,7 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
     if (!user || user.status !== "active") continue;
 
     const daySchedule = user.schedule[today];
-    if (!daySchedule || !daySchedule.enabled) continue;
-
-    // 兼容旧数据（单配置）和新数据（slots数组）
-    const rawSlots = daySchedule.slots
-      ? daySchedule.slots
-      : [{ roomid: daySchedule.roomid, seatid: daySchedule.seatid, times: daySchedule.times, seatPageId: daySchedule.seatPageId || "", fidEnc: daySchedule.fidEnc || "" }];
-    const activeSlots = rawSlots.filter(s => s.times && s.roomid);
+    const activeSlots = getEnabledScheduleSlots(daySchedule);
     if (activeSlots.length === 0) continue;
 
     users.push({
@@ -646,8 +663,8 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
 
 async function dispatchUsersInBatches(env, school, users) {
   const batches = chunkArray(users, BATCH_SIZE);
-  let okBatches = 0;
   const dispatchToken = resolveGitHubToken(env, school);
+  let okBatches = 0;
 
   if (!dispatchToken) {
     console.log(`Dispatch skipped for school ${school.id}: missing GitHub token`);
@@ -661,13 +678,8 @@ async function dispatchUsersInBatches(env, school, users) {
       trigger_date: beijingDate(),
       batch_index: i + 1,
       batch_total: batches.length,
-      users: batches[i].map(u => ({
-        ...u,
-        endtime: school.endtime,
-        strategy: randomizeStrategy(school.strategy),
-      })),
+      users: batches[i].map(u => buildDispatchPayloadForUser(school, u)),
     };
-
     const ok = await dispatchGitHub(dispatchToken, school.repo, payload);
     if (ok) okBatches++;
     console.log(
@@ -1349,11 +1361,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div id="app"></div>
 <script>
 const API_BASE = "";
-let API_KEY = localStorage.getItem("api_key") || "";
+let API_KEY = "";
+try {
+  API_KEY = localStorage.getItem("api_key") || "";
+} catch (_e) {
+  API_KEY = "";
+}
 let currentView = "login";
 let currentSchool = null;
 let schools = [];
 let users = [];
+const ACTIVE_TODAY_CACHE_TTL_MS = 3000;
+const ACTIVE_TODAY_CACHE_PREFIX = "active_today_count:";
 const DEFAULT_READING_ZONE_GROUPS = [
   { floor: "2 楼", zones: [{ id: "13474", name: "西阅览区" }, { id: "13473", name: "东阅览区" }, { id: "13476", name: "西电子阅览区" }, { id: "13472", name: "东电子阅览区" }] },
   { floor: "3 楼", zones: [{ id: "13481", name: "西阅览区" }, { id: "13484", name: "中阅览区" }, { id: "13478", name: "东阅览区" }, { id: "13480", name: "西电子阅览区" }, { id: "13475", name: "东电子阅览区" }] },
@@ -1598,6 +1617,35 @@ function toast(msg, type = "success") {
   setTimeout(() => t.remove(), 3000);
 }
 
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderFatalError(error, source = "runtime") {
+  const app = document.getElementById("app");
+  if (!app) return;
+  const message = error && (error.stack || error.message || String(error)) || "Unknown error";
+  app.innerHTML = \`
+    <div class="container">
+      <div class="card" style="margin-top:32px;border:1px solid #ffd6d6">
+        <div class="card-header">
+          <span class="card-title" style="color:#d4380d">页面加载失败</span>
+        </div>
+        <div style="font-size:14px;color:#666;line-height:1.7">
+          <p>前端脚本遇到了异常，已停止渲染。</p>
+          <p><strong>source:</strong> \${escapeHtml(source)}</p>
+          <pre style="margin-top:12px;white-space:pre-wrap;word-break:break-word;background:#fff7f7;border-radius:8px;padding:12px;color:#a61d24">\${escapeHtml(message)}</pre>
+        </div>
+      </div>
+    </div>
+  \`;
+}
+
 async function copyRoomId(id) {
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1638,6 +1686,102 @@ function renderLogin() {
   \`;
 }
 
+function browserBeijingDayOfWeek() {
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  return days[d.getUTCDay()];
+}
+
+function getEnabledScheduleSlotsClient(daySchedule) {
+  if (!daySchedule || !daySchedule.enabled) return [];
+  const rawSlots = Array.isArray(daySchedule.slots)
+    ? daySchedule.slots
+    : [{
+        roomid: daySchedule.roomid,
+        seatid: daySchedule.seatid,
+        times: daySchedule.times,
+        seatPageId: daySchedule.seatPageId || "",
+        fidEnc: daySchedule.fidEnc || "",
+      }];
+  return rawSlots.filter(slot => slot && slot.times && slot.roomid);
+}
+
+function countActiveUsersForTodayClient(userList) {
+  const today = browserBeijingDayOfWeek();
+  return (Array.isArray(userList) ? userList : []).filter(user => {
+    if (!user || user.status !== "active") return false;
+    return getEnabledScheduleSlotsClient(user.schedule && user.schedule[today]).length > 0;
+  }).length;
+}
+
+function getCachedActiveTodayCount(schoolId) {
+  try {
+    const raw = localStorage.getItem(ACTIVE_TODAY_CACHE_PREFIX + schoolId);
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      localStorage.removeItem(ACTIVE_TODAY_CACHE_PREFIX + schoolId);
+      return null;
+    }
+    return cached;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function setCachedActiveTodayCount(schoolId, payload) {
+  try {
+    localStorage.setItem(
+      ACTIVE_TODAY_CACHE_PREFIX + schoolId,
+      JSON.stringify(payload)
+    );
+  } catch (_e) {
+    // ignore localStorage quota or privacy errors
+  }
+}
+
+function formatActiveTodayMeta(schoolId) {
+  const cached = getCachedActiveTodayCount(schoolId);
+  if (!cached) return "今日活跃: 统计中";
+  if (cached.error) return "今日活跃: 统计失败";
+  return "今日活跃: " + cached.count + " 人";
+}
+
+async function ensureActiveTodayCount(schoolId, force = false) {
+  const cached = getCachedActiveTodayCount(schoolId);
+  if (!force && cached) return cached;
+
+  try {
+    const res = await api("GET", "/api/school/" + schoolId + "/users");
+    if (res.error) throw new Error(res.error);
+    const next = {
+      count: countActiveUsersForTodayClient(res.users || []),
+      expiresAt: Date.now() + ACTIVE_TODAY_CACHE_TTL_MS,
+      error: "",
+    };
+    setCachedActiveTodayCount(schoolId, next);
+    return next;
+  } catch (e) {
+    const next = {
+      count: 0,
+      expiresAt: Date.now() + ACTIVE_TODAY_CACHE_TTL_MS,
+      error: e.message || String(e),
+    };
+    setCachedActiveTodayCount(schoolId, next);
+    return next;
+  }
+}
+
+async function refreshSchoolActiveTodayCounts(force = false) {
+  if (!API_KEY || !Array.isArray(schools) || schools.length === 0) return;
+  await Promise.all(
+    schools
+      .filter(s => s && s.id)
+      .map(s => ensureActiveTodayCount(s.id, force))
+  );
+  if (currentView === "schools") render();
+}
+
 function renderSchools() {
   const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
   return \`
@@ -1652,13 +1796,13 @@ function renderSchools() {
           <button class="btn btn-primary" onclick="showAddSchool()">+ 添加学校</button>
         </div>
         <div class="school-grid">
-          \${schools.length ? schools.map(s => \`
+          \${schools.length ? schools.filter(Boolean).map(s => \`
             <div class="school-card" onclick="openSchool('\${s.id}')">
               <h3>\${s.name}</h3>
               <div class="meta">ID: \${s.id} | 仓库: \${s.repo}</div>
               <div class="stats">
                 <span>\${s.userCount || 0} 名用户</span>
-                <span>独立Token: \${s.has_github_token ? '已配置' : '未配置'}</span>
+                <span>\${formatActiveTodayMeta(s.id)}</span>
                 <span>触发时间: \${s.trigger_time}</span>
               </div>
             </div>
@@ -1699,6 +1843,7 @@ function renderAddSchoolModal() {
               <option value="">默认 GH_TOKEN</option>
               <option value="a">A -> GH_TOKEN_A</option>
               <option value="b">B -> GH_TOKEN_B</option>
+              <option value="c">C -> GH_TOKEN_C</option>
             </select>
           </div>
           <div class="form-row">
@@ -1749,6 +1894,7 @@ function renderSchoolDetail() {
           <div><strong>触发时间:</strong> \${s.trigger_time}</div>
           <div><strong>截止时间:</strong> \${s.endtime}</div>
           <div><strong>GitHub仓库:</strong> \${s.repo}</div>
+          <div><strong>今日活跃用户:</strong> \${formatActiveTodayMeta(s.id)}</div>
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
         </div>
@@ -1872,6 +2018,7 @@ function renderEditSchoolModal() {
               <option value="" \${!s.github_token_key ? "selected" : ""}>默认 GH_TOKEN</option>
               <option value="a" \${s.github_token_key==="a" ? "selected" : ""}>A -> GH_TOKEN_A</option>
               <option value="b" \${s.github_token_key==="b" ? "selected" : ""}>B -> GH_TOKEN_B</option>
+              <option value="c" \${s.github_token_key==="c" ? "selected" : ""}>C -> GH_TOKEN_C</option>
             </select>
           </div>
           <div class="form-row">
@@ -1978,7 +2125,7 @@ function renderEditSchoolModal() {
             </div>
           </div>
           <div style="font-size:12px;color:#666;margin-top:6px">
-            说明：仅 token_fetch_delay_ms 与 burst_offsets_ms 支持范围随机；其余偏移使用固定值。
+            说明：学校批量触发时，会按固定批次拆成多个 workflow；当前每个 workflow 默认承载 10 个用户。
           </div>
           <button class="btn btn-primary" onclick="doEditSchool()" style="width:100%;margin-top:16px">保存配置</button>
           <button class="btn btn-danger" onclick="doDeleteSchool()" style="width:100%;margin-top:8px">删除学校</button>
@@ -2074,12 +2221,14 @@ async function doLogin() {
   schools = res.schools || [];
   currentView = "schools";
   render();
+  refreshSchoolActiveTodayCounts(true);
 }
 
 async function loadSchools() {
   const res = await api("GET", "/api/schools");
   schools = res.schools || [];
   render();
+  refreshSchoolActiveTodayCounts();
 }
 
 function showAddSchool() {
@@ -2133,6 +2282,11 @@ async function openSchool(id) {
   currentSchool = res.school;
   const usersRes = await api("GET", "/api/school/" + id + "/users");
   users = usersRes.users || [];
+  setCachedActiveTodayCount(id, {
+    count: countActiveUsersForTodayClient(users),
+    expiresAt: Date.now() + ACTIVE_TODAY_CACHE_TTL_MS,
+    error: "",
+  });
   currentView = "school";
   render();
 }
@@ -2358,15 +2512,29 @@ async function deleteUser(userId) {
 
 // 初始化
 (async function init() {
-  if (API_KEY) {
-    const res = await api("GET", "/api/schools");
-    if (!res.error) {
-      schools = res.schools || [];
-      currentView = "schools";
+  try {
+    if (API_KEY) {
+      const res = await api("GET", "/api/schools");
+      if (!res.error) {
+        schools = Array.isArray(res.schools) ? res.schools : [];
+        currentView = "schools";
+      }
     }
+    render();
+    refreshSchoolActiveTodayCounts();
+  } catch (e) {
+    console.error("init failed:", e);
+    renderFatalError(e, "init");
   }
-  render();
 })();
+
+window.addEventListener("error", (event) => {
+  renderFatalError(event.error || event.message || "Unknown error", "window.error");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  renderFatalError(event.reason || "Unhandled promise rejection", "unhandledrejection");
+});
 </script>
 </body>
 </html>`;

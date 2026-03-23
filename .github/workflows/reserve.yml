@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 20
+      max-parallel: 10
       matrix:
         user: ${{ fromJson(needs.prepare-dispatch.outputs.users_matrix) }}
 
@@ -253,4 +253,3 @@ jobs:
           status_code="$(curl -sS -o /tmp/feishu_resp.txt -w '%{http_code}' -X POST "$webhook" -H 'Content-Type: application/json' -d "$payload" || true)"
           echo "Feishu response code: ${status_code}"
           cat /tmp/feishu_resp.txt || true
-
