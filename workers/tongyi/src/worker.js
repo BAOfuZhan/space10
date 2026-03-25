@@ -806,27 +806,41 @@ async function dispatchUsersInBatches(env, school, users) {
       users: batches[i].map(u => buildDispatchPayloadForUser(school, u)),
     };
 
-    let githubOk = true;
-    let serverOk = true;
+    let githubStatus = "skip";
+    let serverStatus = "skip";
+    let githubDetail = "";
+    let serverDetail = "";
 
     if (dispatchTarget === "github" || dispatchTarget === "both") {
-      githubOk = await dispatchGitHub(dispatchToken, school.repo, payload);
+      githubStatus = (await dispatchGitHub(dispatchToken, school.repo, payload)) ? "ok" : "fail";
     }
     if (dispatchTarget === "server" || dispatchTarget === "both") {
-      serverOk = await dispatchServer(serverUrl, serverApiKey, payload);
+      const serverResp = await dispatchServerVerbose(serverUrl, serverApiKey, payload);
+      serverStatus = serverResp.ok ? "ok" : "fail";
+      if (!serverResp.ok) {
+        const detailText = normalizeSecretText(serverResp.detail);
+        serverDetail = detailText
+          ? `${serverResp.status || 0}: ${detailText}`
+          : String(serverResp.status || 0);
+      }
     }
 
-    const ok = githubOk && serverOk;
+    const ok = githubStatus !== "fail" && serverStatus !== "fail";
     if (ok) {
       okBatches++;
     } else {
+      const parts = [`batch ${i + 1}: github=${githubStatus}, server=${serverStatus}`];
+      if (githubDetail) parts.push(`github_detail=${githubDetail}`);
+      if (serverDetail) parts.push(`server_detail=${serverDetail}`);
       dispatchErrors.push(
-        `batch ${i + 1}: github=${githubOk ? "ok" : "fail"}, server=${serverOk ? "ok" : "fail"}`
+        parts.join(", ")
       );
     }
     console.log(
       `Dispatch batch ${school.id} ${i + 1}/${batches.length}: ${ok ? "OK" : "FAIL"} `
-      + `(target=${dispatchTarget}, github=${githubOk ? "ok" : "skip/fail"}, server=${serverOk ? "ok" : "skip/fail"})`
+      + `(target=${dispatchTarget}, github=${githubStatus}, server=${serverStatus}`
+      + `${githubDetail ? `, github_detail=${githubDetail}` : ""}`
+      + `${serverDetail ? `, server_detail=${serverDetail}` : ""})`
     );
   }
 
@@ -2160,31 +2174,33 @@ function renderAddSchoolModal() {
             <input type="text" id="new_school_repo" placeholder="BAOfuZhan/hcd">
           </div>
           <div class="form-group">
-            <label>选座接口模式</label>
-            <select id="new_school_seat_api_mode">
-              <option value="auto">auto - 优先 seatengine，失败自动回退</option>
-              <option value="seatengine">seatengine - 强制新版接口</option>
-              <option value="seat" selected>seat - 强制旧版接口</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label><input type="checkbox" id="new_school_reserve_next_day" checked> 预约明天</label>
-            </div>
-            <div class="form-group">
-              <label><input type="checkbox" id="new_school_enable_slider"> 启用滑块验证码</label>
-            </div>
-          </div>
-          <div class="form-group">
-            <label><input type="checkbox" id="new_school_enable_textclick"> 启用选字验证码</label>
-          </div>
-          <div class="form-group">
             <label>分发目标</label>
             <select id="new_school_dispatch_target">
               <option value="github">github - 仅 GitHub Actions</option>
               <option value="server">server - 仅服务器直跑</option>
               <option value="both">both - 同时发 GitHub 和服务器</option>
             </select>
+          </div>
+          <div id="new_school_server_only_fields" style="display:none">
+            <div class="form-group">
+              <label>选座接口模式</label>
+              <select id="new_school_seat_api_mode">
+                <option value="auto">auto - 优先 seatengine，失败自动回退</option>
+                <option value="seatengine">seatengine - 强制新版接口</option>
+                <option value="seat" selected>seat - 强制旧版接口</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label><input type="checkbox" id="new_school_reserve_next_day" checked> 预约明天</label>
+              </div>
+              <div class="form-group">
+                <label><input type="checkbox" id="new_school_enable_slider"> 启用滑块验证码</label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label><input type="checkbox" id="new_school_enable_textclick"> 启用选字验证码</label>
+            </div>
           </div>
           <div class="form-group">
             <label>冲突分组</label>
@@ -2265,11 +2281,11 @@ function renderSchoolDetail() {
           <div><strong>GitHub仓库:</strong> \${s.repo}</div>
           <div><strong>今日活跃用户:</strong> \${formatActiveTodayMeta(s.id)}</div>
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
-          <div><strong>选座接口:</strong> \${s.seat_api_mode || "seat"}</div>
-          <div><strong>预约日期:</strong> \${s.reserve_next_day === false ? "今天" : "明天"}</div>
+          <div><strong>选座接口:</strong> \${(s.dispatch_target === "server" || s.dispatch_target === "both") ? (s.seat_api_mode || "seat") : "-"}</div>
+          <div><strong>预约日期:</strong> \${(s.dispatch_target === "server" || s.dispatch_target === "both") ? (s.reserve_next_day === false ? "今天" : "明天") : "-"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
           <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
-          <div><strong>验证码:</strong> \${s.enable_slider ? "滑块" : (s.enable_textclick ? "选字" : "关闭")}</div>
+          <div><strong>验证码:</strong> \${(s.dispatch_target === "server" || s.dispatch_target === "both") ? (s.enable_slider ? "滑块" : (s.enable_textclick ? "选字" : "关闭")) : "-"}</div>
           <div><strong>分发目标:</strong> \${s.dispatch_target || "github"}</div>
           <div><strong>服务器地址:</strong> \${s.server_url || "-"}</div>
           <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 13}</div>
@@ -2398,25 +2414,6 @@ function renderEditSchoolModal() {
             </select>
           </div>
           <div class="form-group">
-            <label>选座接口模式</label>
-            <select id="edit_school_seat_api_mode">
-              <option value="auto" \${s.seat_api_mode==="auto" ? "selected" : ""}>auto - 优先 seatengine，失败自动回退</option>
-              <option value="seatengine" \${s.seat_api_mode==="seatengine" ? "selected" : ""}>seatengine - 强制新版接口</option>
-              <option value="seat" \${(!s.seat_api_mode || s.seat_api_mode==="seat") ? "selected" : ""}>seat - 强制旧版接口</option>
-            </select>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label><input type="checkbox" id="edit_school_reserve_next_day" \${s.reserve_next_day === false ? "" : "checked"}> 预约明天</label>
-            </div>
-            <div class="form-group">
-              <label><input type="checkbox" id="edit_school_enable_slider" \${s.enable_slider ? "checked" : ""}> 启用滑块验证码</label>
-            </div>
-          </div>
-          <div class="form-group">
-            <label><input type="checkbox" id="edit_school_enable_textclick" \${s.enable_textclick ? "checked" : ""}> 启用选字验证码</label>
-          </div>
-          <div class="form-group">
             <label>GitHub 密匙槽位</label>
             <select id="edit_school_github_token_key">
               <option value="" \${!s.github_token_key ? "selected" : ""}>默认 GH_TOKEN</option>
@@ -2426,6 +2423,27 @@ function renderEditSchoolModal() {
               <option value="d" \${s.github_token_key==="d" ? "selected" : ""}>D -> GH_TOKEN_D</option>
               <option value="e" \${s.github_token_key==="e" ? "selected" : ""}>E -> GH_TOKEN_E</option>
             </select>
+          </div>
+          <div id="edit_school_server_only_fields" style="display:none">
+            <div class="form-group">
+              <label>选座接口模式</label>
+              <select id="edit_school_seat_api_mode">
+                <option value="auto" \${s.seat_api_mode==="auto" ? "selected" : ""}>auto - 优先 seatengine，失败自动回退</option>
+                <option value="seatengine" \${s.seat_api_mode==="seatengine" ? "selected" : ""}>seatengine - 强制新版接口</option>
+                <option value="seat" \${(!s.seat_api_mode || s.seat_api_mode==="seat") ? "selected" : ""}>seat - 强制旧版接口</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label><input type="checkbox" id="edit_school_reserve_next_day" \${s.reserve_next_day === false ? "" : "checked"}> 预约明天</label>
+              </div>
+              <div class="form-group">
+                <label><input type="checkbox" id="edit_school_enable_slider" \${s.enable_slider ? "checked" : ""}> 启用滑块验证码</label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label><input type="checkbox" id="edit_school_enable_textclick" \${s.enable_textclick ? "checked" : ""}> 启用选字验证码</label>
+            </div>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2630,7 +2648,32 @@ function renderUserModal() {
   \`;
 }
 
-function bindEvents() {}
+function _isServerDispatchTarget(value) {
+  const target = String(value || "").trim().toLowerCase();
+  return target === "server" || target === "both";
+}
+
+function toggleSchoolServerOnlyFields(prefix) {
+  const select = document.getElementById(prefix + "_school_dispatch_target");
+  const wrapper = document.getElementById(prefix + "_school_server_only_fields");
+  if (!select || !wrapper) return;
+  wrapper.style.display = _isServerDispatchTarget(select.value) ? "" : "none";
+}
+
+function bindEvents() {
+  const addTarget = document.getElementById("new_school_dispatch_target");
+  if (addTarget && !addTarget.dataset.boundChange) {
+    addTarget.addEventListener("change", () => toggleSchoolServerOnlyFields("new"));
+    addTarget.dataset.boundChange = "1";
+  }
+  const editTarget = document.getElementById("edit_school_dispatch_target");
+  if (editTarget && !editTarget.dataset.boundChange) {
+    editTarget.addEventListener("change", () => toggleSchoolServerOnlyFields("edit"));
+    editTarget.dataset.boundChange = "1";
+  }
+  toggleSchoolServerOnlyFields("new");
+  toggleSchoolServerOnlyFields("edit");
+}
 
 async function doLogin() {
   const key = document.getElementById("apiKey").value;
@@ -2667,38 +2710,34 @@ async function doAddSchool() {
   const id = document.getElementById("new_school_id").value.trim();
   const name = document.getElementById("new_school_name").value.trim();
   const repo = document.getElementById("new_school_repo").value.trim();
-  const seat_api_mode = document.getElementById("new_school_seat_api_mode").value.trim().toLowerCase();
-  const reserve_next_day = document.getElementById("new_school_reserve_next_day").checked;
-  const enable_slider = document.getElementById("new_school_enable_slider").checked;
-  const enable_textclick = document.getElementById("new_school_enable_textclick").checked;
   const dispatch_target = document.getElementById("new_school_dispatch_target").value.trim().toLowerCase();
   const conflict_group = document.getElementById("new_school_conflict_group").value.trim();
   const github_token_key = document.getElementById("new_school_github_token_key").value.trim().toLowerCase();
-  const server_url = document.getElementById("new_school_server_url").value.trim();
-  const server_api_key = document.getElementById("new_school_server_api_key").value.trim();
-  const server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 13;
   const trigger_time = document.getElementById("new_school_trigger").value.trim();
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
   if (!id || !name) return toast("请填写必要信息", "error");
-  const res = await api("POST", "/api/school", {
+  const body = {
     id,
     name,
     repo,
-    seat_api_mode,
-    reserve_next_day,
-    enable_slider,
-    enable_textclick,
     dispatch_target,
     conflict_group,
     github_token_key,
-    server_url,
-    server_api_key,
-    server_max_concurrency,
     trigger_time,
     endtime,
     fidEnc,
-  });
+  };
+  if (_isServerDispatchTarget(dispatch_target)) {
+    body.seat_api_mode = document.getElementById("new_school_seat_api_mode").value.trim().toLowerCase();
+    body.reserve_next_day = document.getElementById("new_school_reserve_next_day").checked;
+    body.enable_slider = document.getElementById("new_school_enable_slider").checked;
+    body.enable_textclick = document.getElementById("new_school_enable_textclick").checked;
+    body.server_url = document.getElementById("new_school_server_url").value.trim();
+    body.server_api_key = document.getElementById("new_school_server_api_key").value.trim();
+    body.server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 13;
+  }
+  const res = await api("POST", "/api/school", body);
   if (res.ok) {
     let msg = "学校添加成功";
     if (res.repoInit) {
@@ -2753,14 +2792,7 @@ function showEditSchool() {
 async function doEditSchool() {
   const s = currentSchool;
   const githubTokenKey = document.getElementById("edit_school_github_token_key").value.trim().toLowerCase();
-  const seatApiMode = document.getElementById("edit_school_seat_api_mode").value.trim().toLowerCase();
-  const reserveNextDay = document.getElementById("edit_school_reserve_next_day").checked;
-  const enableSlider = document.getElementById("edit_school_enable_slider").checked;
-  const enableTextclick = document.getElementById("edit_school_enable_textclick").checked;
   const dispatchTarget = document.getElementById("edit_school_dispatch_target").value.trim().toLowerCase();
-  const serverUrl = document.getElementById("edit_school_server_url").value.trim();
-  const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();
-  const serverMaxConcurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 13;
   const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
   const burstOffsets = burstOffsetsText
     .split(",")
@@ -2792,15 +2824,9 @@ async function doEditSchool() {
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
-    seat_api_mode: seatApiMode,
-    reserve_next_day: reserveNextDay,
-    enable_slider: enableSlider,
-    enable_textclick: enableTextclick,
     dispatch_target: dispatchTarget,
     conflict_group: document.getElementById("edit_school_conflict_group").value.trim(),
     github_token_key: githubTokenKey,
-    server_url: serverUrl,
-    server_max_concurrency: serverMaxConcurrency,
     trigger_time: document.getElementById("edit_school_trigger").value.trim(),
     endtime: document.getElementById("edit_school_endtime").value.trim(),
     fidEnc: document.getElementById("edit_school_fidEnc").value.trim(),
@@ -2823,8 +2849,17 @@ async function doEditSchool() {
       burst_jitter_range_ms: burstJitterRange,
     }
   };
-  if (serverApiKeyInput && serverApiKeyInput !== "******") {
-    body.server_api_key = serverApiKeyInput;
+  if (_isServerDispatchTarget(dispatchTarget)) {
+    body.seat_api_mode = document.getElementById("edit_school_seat_api_mode").value.trim().toLowerCase();
+    body.reserve_next_day = document.getElementById("edit_school_reserve_next_day").checked;
+    body.enable_slider = document.getElementById("edit_school_enable_slider").checked;
+    body.enable_textclick = document.getElementById("edit_school_enable_textclick").checked;
+    body.server_url = document.getElementById("edit_school_server_url").value.trim();
+    body.server_max_concurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 13;
+    const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();
+    if (serverApiKeyInput && serverApiKeyInput !== "******") {
+      body.server_api_key = serverApiKeyInput;
+    }
   }
   const res = await api("PUT", "/api/school/" + s.id, body);
   if (res.ok) {

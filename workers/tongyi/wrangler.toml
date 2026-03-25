@@ -17,6 +17,7 @@ name = "tongyi"
 account_id = "288006df1270dacb1b639eb6b60ad881"
 main = "src/worker.js"
 compatibility_date = "2024-01-01"
+compatibility_flags = ["allow_custom_ports"]
 
 [triggers]
 # 北京时间常规分钟窗口 05:53-21:56，额外补充 21:23-21:26；Cloudflare cron 使用 UTC

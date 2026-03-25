@@ -38,15 +38,17 @@ def _iter_users(payload: dict) -> list[dict]:
 
 
 def _run_one(user: dict, index: int, run_dir: pathlib.Path) -> dict:
+    username = str(user.get("username", "")).strip()
     nickname = (
         user.get("nickname")
         or user.get("nickName")
         or user.get("name")
         or user.get("remark")
-        or user.get("username")
+        or username
         or f"user_{index + 1}"
     )
-    log_path = run_dir / f"{index + 1:02d}_{_safe_name(nickname)}.log"
+    log_name = username or nickname
+    log_path = run_dir / f"{index + 1:02d}_{_safe_name(log_name)}.log"
     env = os.environ.copy()
     env["DISPATCH_PAYLOAD"] = json.dumps(user, ensure_ascii=False)
 
@@ -68,8 +70,9 @@ def _run_one(user: dict, index: int, run_dir: pathlib.Path) -> dict:
 
     return {
         "index": index + 1,
+        "username": username,
+        "display_name": username or nickname,
         "nickname": nickname,
-        "username": user.get("username", ""),
         "returncode": proc.returncode,
         "log_path": str(log_path),
         "started_at": started_at,
