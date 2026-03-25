@@ -9,7 +9,10 @@ import subprocess
 import sys
 
 
-ROOT_DIR = pathlib.Path(__file__).resolve().parent
+DEFAULT_SERVER_PROJECT_ROOT = "/opt/Main_ChaoXingReserveSeat"
+ROOT_DIR = pathlib.Path(
+    os.getenv("SERVER_PROJECT_ROOT", DEFAULT_SERVER_PROJECT_ROOT)
+).resolve()
 RUNS_DIR = ROOT_DIR / "server_runs"
 
 

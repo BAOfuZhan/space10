@@ -7,7 +7,10 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-ROOT_DIR = pathlib.Path(__file__).resolve().parent
+DEFAULT_SERVER_PROJECT_ROOT = "/opt/Main_ChaoXingReserveSeat"
+ROOT_DIR = pathlib.Path(
+    os.getenv("SERVER_PROJECT_ROOT", DEFAULT_SERVER_PROJECT_ROOT)
+).resolve()
 RUNS_DIR = ROOT_DIR / "server_runs"
 API_KEY = os.getenv("SERVER_DISPATCH_API_KEY", "").strip()
 HOST = os.getenv("SERVER_DISPATCH_HOST", "0.0.0.0")
