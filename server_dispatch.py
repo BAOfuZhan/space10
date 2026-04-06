@@ -5,6 +5,7 @@ import pathlib
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from utils.time_utils import apply_custom_day_to_dispatch_payload
 
 
 DEFAULT_SERVER_PROJECT_ROOT = "/opt/Main_ChaoXingReserveSeat"
@@ -69,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            payload = self._read_json()
+            payload = apply_custom_day_to_dispatch_payload(self._read_json())
         except json.JSONDecodeError as e:
             self._reply(400, {"ok": False, "error": f"Invalid JSON: {e}"})
             return

@@ -80,6 +80,11 @@ def _wait_until(
 
 from utils import AES_Decrypt, reserve, get_user_credentials
 from utils.reserve import CredentialRejectedError
+from utils.time_utils import (
+    infer_use_custom_day,
+    parse_times_range,
+    resolve_request_day,
+)
 
 
 def _now(action: bool) -> datetime.datetime:
@@ -167,18 +172,7 @@ MAX_SEAT_INCREMENT_ATTEMPTS = 10
 
 def _normalize_times(times):
     """把 times 统一成 [start, end] 结构。"""
-    if isinstance(times, list) and len(times) >= 2:
-        return [str(times[0]).strip(), str(times[1]).strip()]
-    if isinstance(times, tuple) and len(times) >= 2:
-        return [str(times[0]).strip(), str(times[1]).strip()]
-    if isinstance(times, str):
-        s = times.strip()
-        for sep in ["-", "~", "至"]:
-            if sep in s:
-                parts = [p.strip() for p in s.split(sep, 1)]
-                if len(parts) == 2 and parts[0] and parts[1]:
-                    return parts
-    return times
+    return parse_times_range(times)
 
 
 def _load_runtime_config(config_path, dispatch_mode, action):
@@ -200,7 +194,8 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             if roomid and times:
                 slots = [{"roomid": roomid, "seatid": seatid, "times": times,
                           "seatPageId": payload.get("seatPageId") or "",
-                          "fidEnc": payload.get("fidEnc") or ""}]
+                          "fidEnc": payload.get("fidEnc") or "",
+                          "use_custom_day": payload.get("use_custom_day", False)}]
             else:
                 slots = []
 
@@ -216,10 +211,15 @@ def _load_runtime_config(config_path, dispatch_mode, action):
         for slot in slots:
             seatid = slot.get("seatid")
             times = _normalize_times(slot.get("times"))
+            use_custom_day = infer_use_custom_day(
+                times,
+                slot.get("use_custom_day", payload.get("use_custom_day", False)),
+            )
             reserve_list.append({
                 "username": username,
                 "password": decrypted_password,
                 "times": times,
+                "use_custom_day": use_custom_day,
                 "roomid": slot.get("roomid"),
                 "seatid": seatid if isinstance(seatid, list) else [seatid],
                 "seatPageId": slot.get("seatPageId") or "",
@@ -411,7 +411,7 @@ def _probe_then_get_page_token(
 def _burst_shot_worker(
     index, offset_ms, target_dt, s, token_url,
     times, roomid, seatid, captcha, action, results,
-    pre_token="", pre_value=""
+    pre_token="", pre_value="", use_custom_day=False
 ):
     """定时连发（极限型）的单次提交工作线程。
 
@@ -453,6 +453,7 @@ def _burst_shot_worker(
         captcha=captcha,
         action=action,
         value=value,
+        use_custom_day=use_custom_day,
     )
     results[index] = result
     logging.info(f"[burst] Shot {index + 1} result: {result}")
@@ -514,6 +515,7 @@ def strategic_first_attempt(
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
 
         # 今天不预约该配置，跳过
@@ -542,12 +544,25 @@ def strategic_first_attempt(
             continue
 
         logging.info(
-            f"[strategic] Start first attempt for {username} -- {times} -- {seat_list} -- seatPageId={seat_page_id} -- fidEnc={fid_enc}"
+            f"[strategic] Start first attempt for {username} -- {times} -- {seat_list} "
+            f"-- seatPageId={seat_page_id} -- fidEnc={fid_enc} -- use_custom_day={use_custom_day}"
         )
 
         first_seat = seat_list[0]
-        warm_day = _beijing_now().date()
-        submit_day = warm_day + datetime.timedelta(days=1 if RESERVE_NEXT_DAY else 0)
+        submit_day = resolve_request_day(
+            times,
+            RESERVE_NEXT_DAY,
+            use_custom_day=use_custom_day,
+        )
+        warm_day = submit_day if use_custom_day else str(_beijing_now().date())
+        first_token_day = submit_day
+        if not use_custom_day:
+            first_token_day = str(
+                _get_first_token_day(
+                    _beijing_now().date(),
+                    datetime.date.fromisoformat(submit_day),
+                )
+            )
         captcha1 = captcha2 = captcha3 = ""
         is_primary_strategy_config = shared_strategy_session is None
         if is_primary_strategy_config:
@@ -592,7 +607,7 @@ def strategic_first_attempt(
             s.set_captcha_context(
                 roomid=roomid,
                 seat_num=first_seat,
-                day=str(submit_day),
+                day=submit_day,
                 seat_page_id=seat_page_id,
                 fid_enc=fid_enc,
             )
@@ -631,7 +646,7 @@ def strategic_first_attempt(
                     worker.set_captcha_context(
                         roomid=roomid,
                         seat_num=first_seat,
-                        day=str(submit_day),
+                        day=submit_day,
                         seat_page_id=seat_page_id,
                         fid_enc=fid_enc,
                     )
@@ -734,7 +749,7 @@ def strategic_first_attempt(
                         worker.set_captcha_context(
                             roomid=roomid,
                             seat_num=first_seat,
-                            day=str(submit_day),
+                            day=submit_day,
                             seat_page_id=seat_page_id,
                             fid_enc=fid_enc,
                         )
@@ -827,7 +842,7 @@ def strategic_first_attempt(
             s.set_captcha_context(
                 roomid=roomid,
                 seat_num=first_seat,
-                day=str(submit_day),
+                day=submit_day,
                 seat_page_id=seat_page_id,
                 fid_enc=fid_enc,
             )
@@ -854,27 +869,24 @@ def strategic_first_attempt(
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        # 预热 URL 保持使用当天页面，只用于建立连接，不参与真正提交。
-        _warm_day = warm_day
+        # 自定义日期模式下，预热 / token / submit 一律使用最终提交日；
+        # 普通时间段则保留原有 warm_day / first_token_date_mode 逻辑。
         _warm_url = s.url.format(
             roomId=roomid,
-            day=str(_warm_day),
+            day=warm_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
 
-        # 真正提交通常使用预约日页面；首次取 token 允许按策略改为当天页面。
-        _submit_day = submit_day
-        _first_token_day = _get_first_token_day(_warm_day, _submit_day)
         _first_token_url = s.url.format(
             roomId=roomid,
-            day=str(_first_token_day),
+            day=first_token_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
         _submit_token_url = s.url.format(
             roomId=roomid,
-            day=str(_submit_day),
+            day=submit_day,
             seatPageId=seat_page_id or "",
             fidEnc=fid_enc or "",
         )
@@ -950,7 +962,7 @@ def strategic_first_attempt(
                     args=(
                         burst_i, burst_offset_ms, target_dt, s, _submit_token_url,
                         times, roomid, first_seat, burst_cap, action, burst_results,
-                        pt, pv,
+                        pt, pv, use_custom_day,
                     ),
                     daemon=True,
                     name=f"burst-shot-{burst_i + 1}",
@@ -1006,6 +1018,7 @@ def strategic_first_attempt(
                     captcha=captcha1,
                     action=action,
                     value=value1,
+                    use_custom_day=use_custom_day,
                 )
 
             elif STRATEGIC_MODE == "A":
@@ -1043,6 +1056,7 @@ def strategic_first_attempt(
                     captcha=captcha1,
                     action=action,
                     value=value1,
+                    use_custom_day=use_custom_day,
                 )
 
             else:
@@ -1077,6 +1091,7 @@ def strategic_first_attempt(
                     captcha=captcha1,
                     action=action,
                     value=value1,
+                    use_custom_day=use_custom_day,
                 )
 
             # 如果第一次没有成功：重新获取页面 token，获取后立即提交第二枪
@@ -1123,6 +1138,7 @@ def strategic_first_attempt(
                         captcha=captcha2,
                         action=action,
                         value=value2,
+                        use_custom_day=use_custom_day,
                     )
 
             # 如果第二次仍未成功：重新获取页面 token，获取后立即提交第三枪
@@ -1154,6 +1170,7 @@ def strategic_first_attempt(
                         captcha=captcha3,
                         action=action,
                         value=value3,
+                        use_custom_day=use_custom_day,
                     )
 
         success_list[index] = suc
@@ -1194,6 +1211,7 @@ def login_and_reserve(
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
 
         # 如果今天不在该配置的 daysofweek 中，直接跳过
@@ -1266,6 +1284,7 @@ def login_and_reserve(
                 ENDTIME if action else None,
                 fidEnc=fid_enc,
                 seat_page_id=seat_page_id,
+                use_custom_day=use_custom_day,
             )
             success_list[index] = suc
     return success_list
@@ -1450,6 +1469,7 @@ def debug(users, action=False):
         seatid = user["seatid"]
         seat_page_id = user.get("seatPageId")
         fid_enc = user.get("fidEnc")
+        use_custom_day = bool(user.get("use_custom_day"))
         daysofweek = user["daysofweek"]
         if type(seatid) == str:
             seatid = [seatid]
@@ -1485,7 +1505,16 @@ def debug(users, action=False):
         if not s.bootstrap_login(username, password):
             logging.warning(f"Skip debug reserve attempt for {username}: login bootstrap failed")
             continue
-        suc = s.submit(times, roomid, seatid, action, None, fidEnc=fid_enc, seat_page_id=seat_page_id)
+        suc = s.submit(
+            times,
+            roomid,
+            seatid,
+            action,
+            None,
+            fidEnc=fid_enc,
+            seat_page_id=seat_page_id,
+            use_custom_day=use_custom_day,
+        )
         if suc:
             return
 

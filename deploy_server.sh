@@ -56,6 +56,8 @@ set -euo pipefail
 cd '$REMOTE_PROJECT_DIR'
 python3 -m py_compile main.py server_dispatch.py qianduan/server_api_example.py
 rsync -av --delete \
+  --include 'index.html' \
+  --include 'app.js' \
   --include 'admin.html' \
   --include 'admin.js' \
   --include 'styles.css' \

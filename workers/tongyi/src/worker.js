@@ -729,8 +729,21 @@ function randomizeStrategy(base) {
 }
 
 function buildDispatchPayloadForUser(school, user) {
+  const dispatchTarget = resolveDispatchTarget(school);
+  const slots = Array.isArray(user?.slots)
+    ? user.slots.map(slot => {
+        const nextSlot = { ...slot };
+        const slotUseCustomDay = !!nextSlot.use_custom_day
+          || (dispatchTarget === "server_relay" && isCustomDayTimes(nextSlot.times));
+        if (slotUseCustomDay) {
+          nextSlot.use_custom_day = true;
+        }
+        return nextSlot;
+      })
+    : user?.slots;
   return {
     ...user,
+    ...(slots ? { slots } : {}),
     endtime: school.endtime,
     seat_api_mode: school.seat_api_mode || "seat",
     reserve_next_day: school.reserve_next_day !== false,
@@ -776,19 +789,21 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
 }
 
 async function dispatchUsersInBatches(env, school, users) {
-  const batches = chunkArray(users, BATCH_SIZE);
   const dispatchToken = resolveGitHubToken(env, school);
   const dispatchTarget = resolveDispatchTarget(school);
-  const serverUrl = normalizeSecretText(school?.server_url);
-  const serverApiKey = resolveServerApiKey(env, school);
+  const needsServerDispatch = dispatchTarget === "server_relay" || dispatchTarget === "both";
+  const serverUrl = needsServerDispatch ? normalizeSecretText(school?.server_url) : "";
+  const serverApiKey = needsServerDispatch ? resolveServerApiKey(env, school) : "";
   const serverMaxConcurrency = Math.max(
     1,
     parseInt(school?.server_max_concurrency, 10) || 13,
   );
+  const batchSize = dispatchTarget === "server_relay" ? serverMaxConcurrency : BATCH_SIZE;
+  const batches = chunkArray(users, batchSize);
   let okBatches = 0;
   const dispatchErrors = [];
 
-  if ((dispatchTarget === "github" || dispatchTarget === "both") && !dispatchToken) {
+  if ((dispatchTarget === "github" || dispatchTarget === "server_relay" || dispatchTarget === "both") && !dispatchToken) {
     console.log(`Dispatch skipped for school ${school.id}: missing GitHub token`);
     return { okBatches: 0, totalBatches: batches.length, error: "Missing GitHub token" };
   }
@@ -807,6 +822,10 @@ async function dispatchUsersInBatches(env, school, users) {
       dispatch_target: dispatchTarget,
       server_max_concurrency: serverMaxConcurrency,
       users: batches[i].map(u => buildDispatchPayloadForUser(school, u)),
+      ...(dispatchTarget === "server_relay" ? {
+        server_url: serverUrl,
+        server_api_key: serverApiKey,
+      } : {}),
     };
 
     let githubStatus = "skip";
@@ -883,11 +902,40 @@ function parseSeatIdsRaw(seatidRaw) {
     .filter(Boolean);
 }
 
-function normalizeTimesLabel(rawTimes) {
+const DATE_TEXT_RE = /^\d{4}-\d{2}-\d{2}$/;
+const DATE_PAIR_TEXT_RE = /^\s*(\d{4}-\d{2}-\d{2})\s*[,，]\s*(\d{4}-\d{2}-\d{2})\s*$/;
+
+function parseTimesInput(rawTimes) {
   if (Array.isArray(rawTimes) && rawTimes.length >= 2) {
-    const start = String(rawTimes[0] || "").trim();
-    const end = String(rawTimes[1] || "").trim();
-    return start && end ? `${start}-${end}` : String(rawTimes || "").trim();
+    return [
+      String(rawTimes[0] || "").trim(),
+      String(rawTimes[1] || "").trim(),
+    ];
+  }
+  const text = String(rawTimes || "").trim();
+  if (!text) return ["", ""];
+
+  const datePairMatch = text.match(DATE_PAIR_TEXT_RE);
+  if (datePairMatch) {
+    return [datePairMatch[1], datePairMatch[2]];
+  }
+
+  const parts = text.split(/-|~|至/).map(s => s.trim()).filter(Boolean);
+  if (parts.length >= 2) {
+    return [parts[0], parts[1]];
+  }
+  return [text, ""];
+}
+
+function isCustomDayTimes(rawTimes) {
+  const [start, end] = parseTimesInput(rawTimes);
+  return DATE_TEXT_RE.test(start) && DATE_TEXT_RE.test(end);
+}
+
+function normalizeTimesLabel(rawTimes) {
+  const [start, end] = parseTimesInput(rawTimes);
+  if (start && end) {
+    return isCustomDayTimes([start, end]) ? `${start}，${end}` : `${start}-${end}`;
   }
   return String(rawTimes || "").trim();
 }
@@ -908,13 +956,13 @@ function parseHmsToSeconds(hms) {
 
 function parseTimesRange(rawTimes) {
   const label = normalizeTimesLabel(rawTimes);
-  const parts = label.split(/-|~|至/).map(s => s.trim()).filter(Boolean);
-  if (parts.length < 2) {
+  const [start, end] = parseTimesInput(rawTimes);
+  if (!start || !end) {
     return { label, startSec: null, endSec: null, valid: false };
   }
 
-  const startSec = parseHmsToSeconds(parts[0]);
-  const endSec = parseHmsToSeconds(parts[1]);
+  const startSec = parseHmsToSeconds(start);
+  const endSec = parseHmsToSeconds(end);
   if (startSec === null || endSec === null || endSec <= startSec) {
     return { label, startSec: null, endSec: null, valid: false };
   }
@@ -1777,12 +1825,7 @@ function parseScheduleJsonMapping(rawText) {
     const seatPageId = String(item.seatPageId || item.roomid || "").trim();
     const fidEnc = String(item.fidEnc || "").trim();
 
-    let times = item.times;
-    if (Array.isArray(times) && times.length >= 2) {
-      times = String(times[0]).trim() + "-" + String(times[1]).trim();
-    } else {
-      times = String(times || "").trim();
-    }
+    const times = normalizeTimesLabel(item.times);
 
     let seatid = item.seatid;
     if (Array.isArray(seatid)) {
@@ -1823,11 +1866,7 @@ function scheduleToJsonMapping(schedule) {
       : [{ roomid: dayCfg.roomid, seatid: dayCfg.seatid, times: dayCfg.times, seatPageId: dayCfg.seatPageId, fidEnc: dayCfg.fidEnc }];
     for (const s of slots) {
       if (!s || !s.roomid || !s.times) continue;
-      let times = s.times;
-      if (typeof times === "string") {
-        const p = times.split(/-|~|至/).map(x => x.trim()).filter(Boolean);
-        times = p.length >= 2 ? [p[0], p[1]] : [times, ""];
-      }
+      const times = parseTimesInput(s.times);
       const seatid = String(s.seatid || "").split(",").map(x => x.trim()).filter(Boolean);
       result.push({
         times,
@@ -2198,7 +2237,6 @@ function renderAddSchoolModal() {
             <select id="new_school_dispatch_target">
               <option value="github">github - 仅 GitHub Actions</option>
               <option value="server_relay">server_relay - GitHub 中转到服务器</option>
-              <option value="both">both - GitHub 与服务器直连同时发</option>
             </select>
           </div>
           <div id="new_school_server_only_fields">
@@ -2237,19 +2275,21 @@ function renderAddSchoolModal() {
               <option value="e">E -> GH_TOKEN_E</option>
             </select>
           </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>服务器分发地址</label>
-              <input type="text" id="new_school_server_url" placeholder="例如: https://your-server.example.com/dispatch">
+          <div id="new_school_relay_fields">
+            <div class="form-row">
+              <div class="form-group">
+                <label>服务器分发地址</label>
+                <input type="text" id="new_school_server_url" placeholder="例如: https://your-server.example.com/dispatch">
+              </div>
+              <div class="form-group">
+                <label>服务器最大并发</label>
+                <input type="number" id="new_school_server_max_concurrency" value="13" min="1">
+              </div>
             </div>
             <div class="form-group">
-              <label>服务器最大并发</label>
-              <input type="number" id="new_school_server_max_concurrency" value="13" min="1">
+              <label>服务器 API Key（可留空，优先使用 Worker 环境变量）</label>
+              <input type="text" id="new_school_server_api_key" placeholder="留空则回退到 Worker 环境变量 SERVER_DISPATCH_API_KEY">
             </div>
-          </div>
-          <div class="form-group">
-            <label>服务器 API Key（可留空，优先使用 Worker 环境变量）</label>
-            <input type="text" id="new_school_server_api_key" placeholder="留空则回退到 Worker 环境变量 SERVER_DISPATCH_API_KEY">
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2307,9 +2347,11 @@ function renderSchoolDetail() {
           <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
           <div><strong>验证码:</strong> \${s.enable_slider ? "滑块" : (s.enable_textclick ? "选字" : "关闭")}</div>
           <div><strong>分发目标:</strong> \${s.dispatch_target || "github"}</div>
-          <div><strong>服务器地址:</strong> \${s.server_url || "-"}</div>
-          <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 13}</div>
-          <div><strong>服务器密钥:</strong> \${s.has_server_api_key ? "已配置" : "未配置/使用环境变量"}</div>
+          \${s.dispatch_target === "server_relay" ? \`
+            <div><strong>服务器地址:</strong> \${s.server_url || "-"}</div>
+            <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 13}</div>
+            <div><strong>服务器密钥:</strong> \${s.has_server_api_key ? "已配置" : "未配置/使用环境变量"}</div>
+          \` : ""}
         </div>
       </div>
       <div class="card">
@@ -2430,7 +2472,6 @@ function renderEditSchoolModal() {
             <select id="edit_school_dispatch_target">
               <option value="github" \${(!s.dispatch_target || s.dispatch_target==="github") ? "selected" : ""}>github - 仅 GitHub Actions</option>
               <option value="server_relay" \${s.dispatch_target==="server_relay" ? "selected" : ""}>server_relay - GitHub 中转到服务器</option>
-              <option value="both" \${s.dispatch_target==="both" ? "selected" : ""}>both - GitHub 与服务器直连同时发</option>
             </select>
           </div>
           <div class="form-group">
@@ -2465,19 +2506,21 @@ function renderEditSchoolModal() {
               <label><input type="checkbox" id="edit_school_enable_textclick" \${s.enable_textclick ? "checked" : ""}> 启用选字验证码</label>
             </div>
           </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>服务器分发地址</label>
-              <input type="text" id="edit_school_server_url" value="\${s.server_url || ''}" placeholder="例如: https://your-server.example.com/dispatch">
+          <div id="edit_school_relay_fields">
+            <div class="form-row">
+              <div class="form-group">
+                <label>服务器分发地址</label>
+                <input type="text" id="edit_school_server_url" value="\${s.server_url || ''}" placeholder="例如: https://your-server.example.com/dispatch">
+              </div>
+              <div class="form-group">
+                <label>服务器最大并发</label>
+                <input type="number" id="edit_school_server_max_concurrency" value="\${s.server_max_concurrency || 13}" min="1">
+              </div>
             </div>
             <div class="form-group">
-              <label>服务器最大并发</label>
-              <input type="number" id="edit_school_server_max_concurrency" value="\${s.server_max_concurrency || 13}" min="1">
+              <label>服务器 API Key（留空则保留已有值；使用 ****** 表示不改）</label>
+              <input type="text" id="edit_school_server_api_key" value="" placeholder="\${s.has_server_api_key ? '已配置，留空不修改' : '留空则使用 Worker 环境变量 SERVER_DISPATCH_API_KEY'}">
             </div>
-          </div>
-          <div class="form-group">
-            <label>服务器 API Key（留空则保留已有值；使用 ****** 表示不改）</label>
-            <input type="text" id="edit_school_server_api_key" value="" placeholder="\${s.has_server_api_key ? '已配置，留空不修改' : '留空则使用 Worker 环境变量 SERVER_DISPATCH_API_KEY'}">
           </div>
           <div class="form-group">
             <label>冲突分组</label>
@@ -2668,8 +2711,22 @@ function renderUserModal() {
 function bindEvents() {
   const addTarget = document.getElementById("new_school_dispatch_target");
   const editTarget = document.getElementById("edit_school_dispatch_target");
-  if (addTarget && !addTarget.dataset.boundChange) addTarget.dataset.boundChange = "1";
-  if (editTarget && !editTarget.dataset.boundChange) editTarget.dataset.boundChange = "1";
+  const toggleRelayFields = (targetId, fieldsId) => {
+    const target = document.getElementById(targetId);
+    const fields = document.getElementById(fieldsId);
+    if (!target || !fields) return;
+    fields.style.display = target.value.trim().toLowerCase() === "server_relay" ? "" : "none";
+  };
+  if (addTarget && !addTarget.dataset.boundChange) {
+    addTarget.addEventListener("change", () => toggleRelayFields("new_school_dispatch_target", "new_school_relay_fields"));
+    addTarget.dataset.boundChange = "1";
+  }
+  if (editTarget && !editTarget.dataset.boundChange) {
+    editTarget.addEventListener("change", () => toggleRelayFields("edit_school_dispatch_target", "edit_school_relay_fields"));
+    editTarget.dataset.boundChange = "1";
+  }
+  toggleRelayFields("new_school_dispatch_target", "new_school_relay_fields");
+  toggleRelayFields("edit_school_dispatch_target", "edit_school_relay_fields");
 }
 
 async function doLogin() {
@@ -2729,7 +2786,7 @@ async function doAddSchool() {
   body.reserve_next_day = document.getElementById("new_school_reserve_next_day").checked;
   body.enable_slider = document.getElementById("new_school_enable_slider").checked;
   body.enable_textclick = document.getElementById("new_school_enable_textclick").checked;
-  if (dispatch_target === "server_relay" || dispatch_target === "both") {
+  if (dispatch_target === "server_relay") {
     body.server_url = document.getElementById("new_school_server_url").value.trim();
     body.server_api_key = document.getElementById("new_school_server_api_key").value.trim();
     body.server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 13;
@@ -2849,7 +2906,7 @@ async function doEditSchool() {
   body.reserve_next_day = document.getElementById("edit_school_reserve_next_day").checked;
   body.enable_slider = document.getElementById("edit_school_enable_slider").checked;
   body.enable_textclick = document.getElementById("edit_school_enable_textclick").checked;
-  if (dispatchTarget === "server_relay" || dispatchTarget === "both") {
+  if (dispatchTarget === "server_relay") {
     body.server_url = document.getElementById("edit_school_server_url").value.trim();
     body.server_max_concurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 13;
     const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();

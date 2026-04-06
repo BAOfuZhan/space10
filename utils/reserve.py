@@ -9,6 +9,7 @@ import os
 from urllib.parse import urlparse, parse_qs, unquote
 from urllib3.exceptions import InsecureRequestWarning
 from requests.adapters import HTTPAdapter
+from .time_utils import get_beijing_date, parse_times_range, resolve_request_day
 
 # Load environment variables from .env file
 try:
@@ -57,9 +58,7 @@ def _get_tulingcloud_config():
 
 def get_date(day_offset: int = 0):
     """基于北京时间获取日期字符串，避免时区混乱。"""
-    beijing_today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
-    offset_day = beijing_today + datetime.timedelta(days=day_offset)
-    return offset_day.strftime("%Y-%m-%d")
+    return get_beijing_date(day_offset)
 
 
 class CredentialRejectedError(RuntimeError):
@@ -1305,7 +1304,50 @@ class reserve:
         tl = max_loc
         return tl[0]
 
-    def submit(self, times, roomid, seatid, action, endtime_hms: str | None = None, fidEnc: str | None = None, seat_page_id: str | None = None):
+    def _build_submit_payload(
+        self,
+        times,
+        roomid,
+        seatid,
+        captcha="",
+        *,
+        use_custom_day=False,
+    ):
+        normalized_times = parse_times_range(times)
+        day = resolve_request_day(
+            normalized_times,
+            self.reserve_next_day,
+            use_custom_day=use_custom_day,
+        )
+        parm = {
+            "roomId": roomid,
+            "startTime": normalized_times[0],
+            "endTime": normalized_times[1],
+            "day": day,
+            "seatNum": seatid,
+            "captcha": captcha,
+            "wyToken": "",
+        }
+        logging.info(
+            "submit parameter resolved: raw_times=%s, use_custom_day=%s, resolved_day=%s, submit_param=%s",
+            times,
+            bool(use_custom_day),
+            day,
+            parm,
+        )
+        return normalized_times, day, parm
+
+    def submit(
+        self,
+        times,
+        roomid,
+        seatid,
+        action,
+        endtime_hms: str | None = None,
+        fidEnc: str | None = None,
+        seat_page_id: str | None = None,
+        use_custom_day=False,
+    ):
         """提交预约。
 
         关键点：为了模拟手动“刷新页面再提交”，这里每次尝试前都会重新访问
@@ -1320,10 +1362,12 @@ class reserve:
             fidEnc: 对应前端 URL 中的 fidEnc 参数（例如 "dac916902610d220"）
             seat_page_id: 对应前端 URL 中的 seatId 参数（例如 "3308"）
         """
-        # 计算与 get_submit 相同的预约日期，保证页面 token 与提交使用的是同一天
-        beijing_today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).date()
-        delta_day = 1 if self.reserve_next_day else 0
-        day = beijing_today + datetime.timedelta(days=delta_day)
+        normalized_times = parse_times_range(times)
+        request_day = resolve_request_day(
+            normalized_times,
+            self.reserve_next_day,
+            use_custom_day=use_custom_day,
+        )
         
         # 每次调用 submit 时重置 max_attempt，确保每个配置都有充足的重试机会
         original_max_attempt = self.max_attempt
@@ -1346,14 +1390,14 @@ class reserve:
                 # 使用 seatengine/select 页面获取 submit_enc，相当于手动刷新选座页
                 page_url = self.url.format(
                     roomId=roomid,
-                    day=str(day),
+                    day=request_day,
                     seatPageId=seat_page_id or "",
                     fidEnc=fidEnc or "",
                 )
                 self.set_captcha_context(
                     roomid=roomid,
                     seat_num=seat,
-                    day=str(day),
+                    day=request_day,
                     seat_page_id=seat_page_id,
                     fid_enc=fidEnc,
                 )
@@ -1383,13 +1427,14 @@ class reserve:
                     logging.info(f"Textclick captcha token: {captcha}")
                 suc = self.get_submit(
                     self.submit_url,
-                    times=times,
+                    times=normalized_times,
                     token=token,
                     roomid=roomid,
                     seatid=seat,
                     captcha=captcha,
                     action=action,
                     value=value,
+                    use_custom_day=use_custom_day,
                 )
                 if suc:
                     return suc
@@ -1398,26 +1443,27 @@ class reserve:
         return suc
 
     def get_submit(
-        self, url, times, token, roomid, seatid, captcha="", action=False, value=""
+        self,
+        url,
+        times,
+        token,
+        roomid,
+        seatid,
+        captcha="",
+        action=False,
+        value="",
+        use_custom_day=False,
     ):
-        # 统一以北京时间（UTC+8）的"今天"为基准，不再区分本地 / GitHub Actions，
-        # 是否预约明天仅由 self.reserve_next_day 决定。
-        beijing_today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).date()
-        delta_day = 1 if self.reserve_next_day else 0
-        day = beijing_today + datetime.timedelta(days=delta_day)
         # 与前端保持一致：提交 roomId/startTime/endTime/day/seatNum/captcha/wyToken，再计算 enc
         # 按前端逻辑：wyToken 仅在开启网易风控时由 wyRiskObj.getToken() 生成；
         # 常规情况下为空字符串，这里保持一致，不再把 submit_enc 当作 wyToken 传给后端。
-        parm = {
-            "roomId": roomid,
-            "startTime": times[0],
-            "endTime": times[1],
-            "day": str(day),
-            "seatNum": seatid,
-            "captcha": captcha,
-            "wyToken": "",
-        }
-        logging.info(f"submit parameter (before enc) {parm} ")
+        normalized_times, _, parm = self._build_submit_payload(
+            times,
+            roomid,
+            seatid,
+            captcha,
+            use_custom_day=use_custom_day,
+        )
         # 使用页面上的 submit_enc（value）作为算法值生成 enc
         parm["enc"] = verify_param(parm, value)
         logging.info(f"submit enc: {parm['enc']}")
@@ -1427,7 +1473,7 @@ class reserve:
         if data is None:
             return False
         self.last_submit_result = data
-        self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
+        self.submit_msg.append(normalized_times[0] + "~" + normalized_times[1] + ":  " + str(data))
         logging.info(data)
 
         # 特殊处理：服务器返回 302 错误码（"您在页面停留过久，本次操作安全验证已超时。请刷新后再提交预约(代码:302)"）
@@ -1441,30 +1487,33 @@ class reserve:
 
         return data.get("success", False)
 
-    def burst_submit_once(self, times, roomid, seatid, captcha, token, value):
+    def burst_submit_once(
+        self,
+        times,
+        roomid,
+        seatid,
+        captcha,
+        token,
+        value,
+        use_custom_day=False,
+    ):
         """单次提交，返回完整响应 dict，用于 1.8 秒高频窗口内的逻辑判断。
 
         注意：这里沿用新的 enc 生成方式，token 仅作为前端算法值 value 的来源，
         不再直接作为提交字段发送给后端。
         """
-        beijing_today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).date()
-        delta_day = 1 if self.reserve_next_day else 0
-        day = beijing_today + datetime.timedelta(days=delta_day)
-        parm = {
-            "roomId": roomid,
-            "startTime": times[0],
-            "endTime": times[1],
-            "day": str(day),
-            "seatNum": seatid,
-            "captcha": captcha,
-            "wyToken": "",
-        }
-        logging.info(f"[burst] submit parameter (before enc) {parm} ")
+        normalized_times, _, parm = self._build_submit_payload(
+            times,
+            roomid,
+            seatid,
+            captcha,
+            use_custom_day=use_custom_day,
+        )
         parm["enc"] = verify_param(parm, value)
         data = self._submit_with_fallback(parm, request_name="[burst] seat submit")
         if data is None:
             return {"success": False, "msg": "submit request failed on all API families"}
         self.last_submit_result = data
-        self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
+        self.submit_msg.append(normalized_times[0] + "~" + normalized_times[1] + ":  " + str(data))
         logging.info(data)
         return data
